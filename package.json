@@ -1,0 +1,42 @@
+{
+  "name": "@danu28/smart-tools",
+  "version": "2.1.0",
+  "description": "smart-tools — batching + fuzzy edits + productivity suite for pi: smart_read/write/edit/bash/grep/patch 8:1, queue-safe, timeout gates, LRU cache, telemetry",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "smart-tools", "batch", "fuzzy"],
+  "license": "MIT",
+  "author": {
+    "name": "Danu28",
+    "url": "https://github.com/Danu28"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Danu28/smart-tools.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Danu28/smart-tools/issues"
+  },
+  "homepage": "https://github.com/Danu28/smart-tools#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "@types/node": "^24",
+    "typebox": "^1.3.30",
+    "typescript": "^5"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --skipLibCheck",
+    "check": "tsc --noEmit --skipLibCheck"
+  }
+}
