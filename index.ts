@@ -499,9 +499,16 @@ export default function smartTools(pi: ExtensionAPI): void {
 				return new Text(text, 0, 0);
 			}
 			let text = `${theme.fg(d.noOp?"warn":"success", d.noOp?"○":"✓")} ${theme.fg("accent", d.path)} ${theme.fg("dim", `${d.applied ?? 0} edit(s)`)}`;
+			if (d.bytesBefore != null && d.bytesAfter != null) {
+				const delta = d.bytesAfter - d.bytesBefore;
+				text += theme.fg("dim", ` ${d.bytesBefore}→${d.bytesAfter} (${delta>0?"+" : ""}${delta}B)`);
+			}
 			if (d.dedupSkipped) text += theme.fg("dim", ` (+${d.dedupSkipped} dedup)`);
 			if (!opts.expanded) text += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else if (d.strategies) text += `\n ${theme.fg("muted", d.strategies.map((s:any)=>`#${s.i}:${s.s}(${s.c})`).join(" "))}`;
+			else {
+				if (d.strategies) text += `\n ${theme.fg("muted", d.strategies.map((s:any)=>`#${s.i}:${s.s}(${(s.c*100|0)}%)`).join(" "))}`;
+				text += `\n ${theme.fg("dim", "what happened: " + (d.applied?`${d.applied} hunk(s) applied` : "no-op") + (d.noOp?" — content unchanged":""))}`;
+			}
 			return new Text(text, 0, 0);
 		},
 	});
@@ -600,16 +607,23 @@ export default function smartTools(pi: ExtensionAPI): void {
 		renderCall(args, theme) {
 			const n = (args.files as any[]).length;
 			const hasOffset = (args.files as any[]).some((f:any)=> typeof f !== "string" && (f.offset!=null || f.limit!=null));
+			const preview = (args.files as any[]).slice(0,2).map((f:any)=> typeof f==="string"?f:(f as any).path).join(", ");
 			let t = theme.fg("toolTitle", theme.bold("smart_read ")) + theme.fg("muted", `${n} file(s)`);
+			if (preview) t += theme.fg("dim", `: ${preview}`) + (n>2?theme.fg("dim", ` +${n-2} more`):"");
 			if (hasOffset) t += theme.fg("dim", " +offset/limit");
 			return new Text(t, 0, 0);
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
 			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)}`;
-			if (d?.cacheHits) t += theme.fg("dim", ` ${d.cacheHits} cached`);
+			if (d?.cacheHits) t += theme.fg("success", ` ↻${d.cacheHits} cached`);
+			if (d?.perFileBudget) t += theme.fg("dim", ` budget:${formatSize(d.perFileBudget)}/file`);
 			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else t += `\n${(d?.files ?? []).map((f:string)=>` ${theme.fg("muted", f)}`).join("\n")}`;
+			else {
+				t += `\n${(d?.files ?? []).slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
+				if ((d?.files?.length??0)>8) t += `\n ${theme.fg("dim", `+${d.files.length-8} more`)}`;
+				t += `\n ${theme.fg("dim", "what happened: " + (d?.count??0) + " file(s) read" + (d?.cacheHits?` (${d.cacheHits} from cache)` : ""))}`;
+			}
 			return new Text(t, 0, 0);
 		},
 	});
@@ -662,14 +676,22 @@ export default function smartTools(pi: ExtensionAPI): void {
 			};
 		},
 		renderCall(args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("smart_write ")) + theme.fg("muted", `${args.writes.length} file(s)`), 0, 0);
+			const preview = args.writes.slice(0,2).map((w:any)=>w.path).join(", ");
+			let t = theme.fg("toolTitle", theme.bold("smart_write ")) + theme.fg("muted", `${args.writes.length} file(s)`);
+			if (preview) t += theme.fg("dim", `: ${preview}`) + (args.writes.length>2?theme.fg("dim", ` +${args.writes.length-2} more`):"");
+			return new Text(t, 0, 0);
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
 			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)}`;
+			if (d?.written?.length) t += theme.fg("dim", ` ${d.written.length} written`);
 			if (d?.skipped?.length) t += theme.fg("dim", ` ${d.skipped.length} skipped`);
 			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else t += `\n${(d?.writes ?? []).map((f:string)=>` ${theme.fg(d?.skipped?.includes(f)?"dim":"muted", f + (d?.skipped?.includes(f)?" (skip)":""))}`).join("\n")}`;
+			else {
+				t += `\n${(d?.writes ?? []).slice(0,8).map((f:string)=>`  ${theme.fg(d?.skipped?.includes(f)?"dim":"muted", (d?.skipped?.includes(f)?"○":"•")+" "+f + (d?.skipped?.includes(f)?" (no-op — hash equal)":""))}`).join("\n")}`;
+				if ((d?.writes?.length??0)>8) t += `\n ${theme.fg("dim", `+${d.writes.length-8} more`)}`;
+				t += `\n ${theme.fg("dim", "what happened: " + (d?.written?.length??0) + " written" + (d?.skipped?.length?`, ${d.skipped.length} skipped (unchanged)`:""))}`;
+			}
 			return new Text(t, 0, 0);
 		},
 	});
@@ -793,12 +815,21 @@ export default function smartTools(pi: ExtensionAPI): void {
 			return { content: [{ type: "text", text }], details: { query: params.query, hits, engine: used, reads: reads.length, count: hits.length } };
 		},
 		renderCall(args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("smart_grep ")) + theme.fg("muted", `"${(args.query as string).slice(0,40)}"`), 0, 0);
+			let t = theme.fg("toolTitle", theme.bold("smart_grep ")) + theme.fg("muted", `"${(args.query as string).slice(0,40)}"`);
+			if ((args as any).includeRead) t += theme.fg("dim", " +read");
+			return new Text(t, 0, 0);
 		},
-		renderResult(result, _opts, theme) {
+		renderResult(result, opts, theme) {
 			const d = result.details as any;
 			let t = `${theme.fg("success","✓")} ${theme.fg("accent", `${d?.count ?? 0} hits`)} ${theme.fg("dim", `via ${d?.engine ?? "rg"}`)}`;
 			if (d?.reads) t += theme.fg("dim", ` +${d.reads} reads`);
+			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+			else {
+				const hits = (d?.hits ?? []).slice(0,4) as Array<any>;
+				if (hits.length) t += `\n${hits.map((h:any)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", `${h.file}:${h.line}`)} ${theme.fg("dim", h.preview.slice(0,60))}`).join("\n")}`;
+				if ((d?.count??0)>4) t += `\n ${theme.fg("dim", `+${d.count-4} more`)}`;
+				t += `\n ${theme.fg("dim", "what happened: " + (d?.count??0) + " hit(s)" + (d?.reads?` +${d.reads} file(s) read`:""))}`;
+			}
 			return new Text(t, 0, 0);
 		}
 	});
@@ -841,10 +872,23 @@ export default function smartTools(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `smart_patch: applied ${files.length || "?"} file(s): ${files.join(", ") || "(see patch)"}` }], details: { files, applied: true, bytes: patch.length } };
 			} finally { try { const { unlink } = await import("node:fs/promises"); await unlink(tmp); } catch {} }
 		},
-		renderCall(_args, theme) { return new Text(theme.fg("toolTitle", theme.bold("smart_patch")) + theme.fg("dim", " unified diff"), 0, 0); },
-		renderResult(result, _opts, theme) {
+		renderCall(args, theme) {
+			const patch = (args as any).patch as string;
+			const files = [...(patch.matchAll(/^\+\+\+ b\/(.+)$/gm) as any)].map((m:any)=>m[1]).slice(0,2);
+			let t = theme.fg("toolTitle", theme.bold("smart_patch")) + theme.fg("dim", " unified diff");
+			if (files.length) t += theme.fg("dim", `: ${files.join(", ")}`) + ((patch.match(/\+\+\+ b\//g)||[]).length>2?theme.fg("dim", ` +${(patch.match(/\+\+\+ b\//g)||[]).length-2} more`):"");
+			return new Text(t, 0, 0);
+		},
+		renderResult(result, opts, theme) {
 			const d = result.details as any;
-			return new Text(`${theme.fg("success","✓")} ${theme.fg("accent", d?.files?.length ? `${d.files.length} file(s)` : "patch")} ${theme.fg("dim", "applied")}`, 0, 0);
+			let t = `${theme.fg("success","✓")} ${theme.fg("accent", d?.files?.length ? `${d.files.length} file(s)` : "patch")} ${theme.fg("dim", "applied")}`;
+			if (d?.bytes) t += theme.fg("dim", ` ${formatSize(d.bytes)}`);
+			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+			else {
+				if (d?.files?.length) t += `\n${d.files.slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
+				t += `\n ${theme.fg("dim", "what happened: patch applied atomically" + (d?.files?.length?` to ${d.files.length} file(s)`:""))}`;
+			}
+			return new Text(t, 0, 0);
 		}
 	});
 
@@ -951,7 +995,9 @@ export default function smartTools(pi: ExtensionAPI): void {
 		},
 		renderCall(args, theme) {
 			const n = (args.commands as any[]).length;
+			const first = (args.commands as any[]).slice(0,2).map((c:any)=> typeof c==="string"?c:(c as any).cmd).join(" | ").slice(0,60);
 			let t = theme.fg("toolTitle", theme.bold("smart_bash ")) + theme.fg("muted", `${n} cmd(s)`);
+			if (first) t += theme.fg("dim", `: ${first}`) + (n>2?theme.fg("dim", ` +${n-2} more`):"");
 			if ((args as any).parallel) t += theme.fg("dim", " parallel");
 			if ((args as any).stopOnError === false) t += theme.fg("dim", " no-stop");
 			return new Text(t, 0, 0);
@@ -964,7 +1010,14 @@ export default function smartTools(pi: ExtensionAPI): void {
 			if (d?.dedupSkipped?.length) t += theme.fg("dim", ` ≡${d.dedupSkipped.length}`);
 			if (d?.stoppedAt != null) t += theme.fg("warning", ` stopped@${d.stoppedAt}`);
 			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else if (d?.results) t += `\n${d.results.slice(0, 4).map((r: any) => ` ${theme.fg(r.exitCode === 0 ? "muted" : "warning", `[${r.idx}] ${r.cmd.slice(0, 50)} → ${r.exitCode}`)}`).join("\n")}${d.results.length > 4 ? `\n ${theme.fg("dim", `+${d.results.length - 4} more`)}` : ""}`;
+			else if (d?.results) {
+				t += `\n${d.results.slice(0, 4).map((r: any) => {
+					const preview = (r.stdout||"").split("\n")[0].slice(0,60).replace(/\s+/g," ");
+					const tag = r.dedup ? "≡" : (r.exitCode===0?"✓":r.timedOut?"⏱":"✗");
+					return ` ${theme.fg(r.exitCode === 0 && !r.dedup ? "muted" : r.dedup ? "dim" : "warning", `[${r.idx}] ${tag} ${r.cmd.slice(0, 40)} → ${r.exitCode}` + (preview?` ${theme.fg("dim", `"${preview}"`)}`:""))}`;
+				}).join("\n")}${d.results.length > 4 ? `\n ${theme.fg("dim", `+${d.results.length - 4} more`)}` : ""}`;
+				t += `\n ${theme.fg("dim", "what happened: " + (d?.results?.filter((r:any)=>!r.dedup).length??0) + " cmd(s) executed" + (d?.dedupSkipped?.length?`, ${d.dedupSkipped.length} dedup` : "") + (d?.stoppedAt!=null?` (stopped @${d.stoppedAt})`:""))}`;
+			}
 			return new Text(t, 0, 0);
 		},
 	});
