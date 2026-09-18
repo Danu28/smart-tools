@@ -1,7 +1,7 @@
 {
   "name": "@danu28/smart-tools",
   "version": "2.1.0",
-  "description": "smart-tools — batching + fuzzy edits + productivity suite for pi: smart_read/write/edit/bash/grep/patch 8:1, queue-safe, timeout gates, LRU cache, telemetry",
+  "description": "smart-tools — batching + fuzzy edits + productivity suite for pi: smart_read/write/edit/grep/patch 8:1, queue-safe, timeout gates, LRU cache, telemetry",
   "type": "module",
   "keywords": ["pi-package", "pi-extension", "smart-tools", "batch", "fuzzy"],
   "license": "MIT",

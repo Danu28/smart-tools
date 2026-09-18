@@ -13,7 +13,6 @@
  *  8. prompt bloat             -> deferred loading via search_smart_tools
  *  9. invisible cost           -> LRU read cache (32/5min) + telemetry (saved calls/tokens/cache hits)
  *  10. cryptic UX              -> rich status widget + /smart-status + /smart-history + streaming
- *  11. bash N:1 batch gap       -> smart_bash (8 cmds per 1 call, parallel/sequential, per-cmd cwd/timeout, dedup, truncated)
  *
  * Generic: works for any workflow. All new params optional, back-compat.
  * Load: pi -e ./index.ts  (or ./.pi/extensions/smart-tools/index.ts)
@@ -55,7 +54,6 @@ interface SmartState {
 	smartWrites: number;
 	smartGreps: number;
 	smartPatches: number;
-	smartBashes: number;
 	searches: number;
 	callsSaved: number;
 	cacheHits: number;
@@ -71,7 +69,6 @@ const state: SmartState = {
 	smartWrites: 0,
 	smartGreps: 0,
 	smartPatches: 0,
-	smartBashes: 0,
 	searches: 0,
 	callsSaved: 0,
 	cacheHits: 0,
@@ -97,14 +94,14 @@ function estimateTokens(bytes: number): number { return Math.ceil(bytes / 4); }
 // Status = minimal dot + label (no numbers) — persistent footer, never duplicates widget
 // Widget = rich dashboard (all numbers once) — above editor, theme-aware
 function renderStatus(theme: any): string {
-	const hasActivity = state.callsSaved > 0 || state.smartReads > 0 || state.smartEdits > 0 || state.smartBashes > 0;
+	const hasActivity = state.callsSaved > 0 || state.smartReads > 0 || state.smartEdits > 0;
 	const dot = hasActivity ? theme.fg("success", "●") : theme.fg("dim", "○");
 	const label = theme.fg("accent", " smart-tools");
 	const hint = hasActivity ? theme.fg("dim", " · active") : theme.fg("dim", " · ready");
 	return `${dot}${label}${hint}`;
 }
 function renderWidgetLines(theme: any): string[] {
-	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartPatches===0 && state.smartBashes===0 && state.callsSaved===0;
+	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartPatches===0 && state.callsSaved===0;
 	if (idle) {
 		return [ `${theme.fg("dim", "◇")} ${theme.fg("accent","smart-tools")} ${theme.fg("dim","·")} ${theme.fg("muted","batch 8:1 · fuzzy edits · queue-safe · 30s timeout")}` ];
 	}
@@ -114,7 +111,6 @@ function renderWidgetLines(theme: any): string[] {
 	if (state.smartWrites) parts.push(`${theme.fg("muted","writes")} ${theme.fg("accent", String(state.smartWrites))}${state.dedupSkipped ? theme.fg("dim", ` ≡${state.dedupSkipped}`) : ""}`);
 	if (state.smartGreps) parts.push(`${theme.fg("muted","grep")} ${theme.fg("accent", String(state.smartGreps))}`);
 	if (state.smartPatches) parts.push(`${theme.fg("muted","patch")} ${theme.fg("accent", String(state.smartPatches))}`);
-	if (state.smartBashes) parts.push(`${theme.fg("muted","bash")} ${theme.fg("accent", String(state.smartBashes))}`);
 	const line1 = `${theme.fg("accent","◇ smart-tools")}  ${theme.fg("dim","│")}  ${parts.join(theme.fg("dim"," · "))}`;
 	const sub: string[] = [];
 	if (state.callsSaved) sub.push(`${theme.fg("success", String(state.callsSaved))}${theme.fg("dim"," saved")}${state.tokensSavedEst ? theme.fg("dim", ` ~${formatSize(state.tokensSavedEst*4)}`) : ""}`);
@@ -128,8 +124,8 @@ function renderWidgetLines(theme: any): string[] {
 function describeSmart(): string { return `smart-tools · ${state.callsSaved ? state.callsSaved + " saved" : "ready"}`; }
 function widgetLines(): string[] {
 	const a: string[] = [];
-	a.push(`smart-tools  edits:${state.smartEdits}  reads:${state.smartReads}${state.cacheHits ? ` (${state.cacheHits} cache hit)` : ""}  writes:${state.smartWrites}${state.dedupSkipped ? ` (${state.dedupSkipped} no-op skip)` : ""}  bash:${state.smartBashes}`);
-	if (state.smartGreps || state.smartPatches || state.smartBashes || state.searches) a.push(`grep:${state.smartGreps} patch:${state.smartPatches} bash:${state.smartBashes} search:${state.searches}`);
+	a.push(`smart-tools  edits:${state.smartEdits}  reads:${state.smartReads}${state.cacheHits ? ` (${state.cacheHits} cache hit)` : ""}  writes:${state.smartWrites}${state.dedupSkipped ? ` (${state.dedupSkipped} no-op skip)` : ""}`);
+	if (state.smartGreps || state.smartPatches || state.searches) a.push(`grep:${state.smartGreps} patch:${state.smartPatches} search:${state.searches}`);
 	if (state.callsSaved) a.push(`saved ~${state.callsSaved} LLM calls · ~${estimateTokens(state.tokensSavedEst*4)} tokens · bash injected:${state.bashInjected}`);
 	else a.push(`batch 8:1 · fuzzy edits · queue-safe · timeout 30s`);
 	return a;
@@ -386,25 +382,6 @@ const searchSmartToolsParams = Type.Object({
 	query: Type.String({ description: "Capability to search (grep|patch|smart tools)" }),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Max tools to load" })),
 });
-
-const smartBashParams = Type.Object({
-	commands: Type.Array(
-		Type.Union([
-			Type.String({ description: "Shell command to execute" }),
-			Type.Object({
-				cmd: Type.String({ description: "Shell command to execute" }),
-				cwd: Type.Optional(Type.String({ description: "Working directory for this command" })),
-				timeout: Type.Optional(Type.Integer({ minimum: 2000, maximum: 120000, description: "Timeout ms for this command (2s-120s)" })),
-			}),
-		]),
-		{ minItems: 1, maxItems: 8, description: "Up to 8 commands per 1 LLM call — batched shell execution" },
-	),
-	parallel: Type.Optional(Type.Boolean({ description: "Run commands in parallel vs sequential (default false — sequential)" })),
-	stopOnError: Type.Optional(Type.Boolean({ description: "Stop at first non-zero exit when sequential (default true)" })),
-	cwd: Type.Optional(Type.String({ description: "Global working directory fallback for all commands" })),
-	timeout: Type.Optional(Type.Integer({ minimum: 2000, maximum: 120000, description: "Global timeout ms fallback (default 10000)" })),
-});
-export type SmartBashInput = Static<typeof smartBashParams>;
 
 // ---------------------------------------------------------------------------
 // Main extension
@@ -892,136 +869,6 @@ export default function smartTools(pi: ExtensionAPI): void {
 		}
 	});
 
-	// ---- smart_bash — batched shell (8:1), parallel/sequential, per-command cwd/timeout
-	const smartBashTool = defineTool({
-		name: "smart_bash",
-		label: "Smart Bash",
-		description: "ALWAYS use instead of bash: batched 8:1 shell execution — parallel or sequential, per-command cwd/timeout, truncated structured results. Saves N LLM calls.",
-		promptSnippet: "ALWAYS use smart_bash instead of bash — batched 8:1, parallel or sequential",
-		promptGuidelines: [
-			"ALWAYS use smart_bash instead of bash — batch up to 8 shell commands in one LLM call to save calls; use for ls, cat, git, npm, rg, find, etc.",
-			"Supports per-command cwd/timeout and parallel mode; sequential stops on error by default (stopOnError:true).",
-			"Outputs are truncated to 50KB/2000 lines per command — use narrow commands or head/tail filters for large outputs.",
-		],
-		parameters: smartBashParams,
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const raw = params.commands.slice(0, 8);
-			const globalCwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
-			const globalTimeout = Math.min(120000, Math.max(2000, params.timeout ?? 10000));
-			const parallel = params.parallel ?? false;
-			const stopOnError = params.stopOnError ?? true;
-			// normalize
-			const normalized = raw.map((c) => {
-				if (typeof c === "string") return { cmd: c, cwd: globalCwd, timeout: globalTimeout };
-				const cmd = (c as any).cmd as string;
-				const cwd = (c as any).cwd ? resolve(ctx.cwd, (c as any).cwd) : globalCwd;
-				const t = (c as any).timeout != null ? Math.min(120000, Math.max(2000, (c as any).timeout)) : globalTimeout;
-				return { cmd, cwd, timeout: t };
-			});
-			// dedup identical cmd+cwd (keep first)
-			const seen = new Set<string>();
-			const dedupSkipped: number[] = [];
-			const toRun: Array<{ idx: number; cmd: string; cwd: string; timeout: number }> = [];
-			normalized.forEach((n, i) => {
-				const key = `${n.cwd}::${n.cmd}`;
-				if (seen.has(key)) { dedupSkipped.push(i); return; }
-				seen.add(key);
-				toRun.push({ idx: i, ...n });
-			});
-			if (dedupSkipped.length) onUpdate?.({ message: `smart_bash dedup skipped ${dedupSkipped.length}` } as any);
-			const execOne = async (item: { idx: number; cmd: string; cwd: string; timeout: number }) => {
-				onUpdate?.({ message: `smart_bash ${item.idx + 1}/${raw.length}: ${item.cmd.slice(0, 60)}` } as any);
-				const start = Date.now();
-				try {
-					const { stdout, stderr } = await exec(item.cmd, { cwd: item.cwd, timeout: item.timeout, maxBuffer: 2_000_000 } as any);
-					const out = String(stdout ?? "");
-					const err = String(stderr ?? "");
-					const combined = err ? `${out}${out && err ? "\n" : ""}${err}` : out;
-					const trunc = truncateHead(combined || "(no output)", { maxLines: 2000, maxBytes: 50000 });
-					const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}]` : trunc.content;
-					return { idx: item.idx, cmd: item.cmd, cwd: item.cwd, exitCode: 0, stdout: text, stderr: "", ms: Date.now() - start, truncated: trunc.truncated, timedOut: false };
-				} catch (e: any) {
-					const stdout = String(e?.stdout ?? "");
-					const stderr = String(e?.stderr ?? e?.message ?? "");
-					const code = typeof e?.code === "number" ? e.code : (e?.status ?? 1);
-					const killed = e?.killed === true;
-					const isTimeout = killed || String(e?.signal) === "SIGTERM" || String(stderr).includes("timed out") || (Date.now() - start) >= item.timeout - 50;
-					const combined = stdout && stderr ? `${stdout}\n${stderr}` : (stdout || stderr || String(e?.message ?? ""));
-					const trunc = truncateHead(combined.slice(0, 100000) || `(exit ${code})`, { maxLines: 2000, maxBytes: 50000 });
-					const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}]` : trunc.content;
-					if (isTimeout) state.timeoutsDetected += 1;
-					return { idx: item.idx, cmd: item.cmd, cwd: item.cwd, exitCode: code, stdout: text, stderr: "", ms: Date.now() - start, truncated: trunc.truncated, timedOut: isTimeout };
-				}
-			};
-			let results: Array<any> = [];
-			let stoppedAt: number | null = null;
-			if (parallel) {
-				const settled = await Promise.all(toRun.map(execOne));
-				results = settled.sort((a, b) => a.idx - b.idx);
-			} else {
-				for (const item of toRun.sort((a, b) => a.idx - b.idx)) {
-					const r = await execOne(item);
-					results.push(r);
-					if (stopOnError && r.exitCode !== 0) { stoppedAt = item.idx; break; }
-				}
-			}
-			// build dedup placeholders for skipped indices
-			const dedupResults = dedupSkipped.map((idx) => ({ idx, cmd: normalized[idx].cmd, cwd: normalized[idx].cwd, exitCode: 0, stdout: "(dedup skipped — identical cmd+cwd earlier in batch)", stderr: "", ms: 0, truncated: false, timedOut: false, dedup: true }));
-			const all = [...results, ...dedupResults].sort((a, b) => a.idx - b.idx);
-			state.smartBashes += 1;
-			if (dedupSkipped.length) state.dedupSkipped += dedupSkipped.length;
-			const uniqueCount = toRun.length;
-			if (uniqueCount > 1) { state.callsSaved += (uniqueCount - 1); state.tokensSavedEst += estimateTokens(uniqueCount * 400); }
-			// also count raw batch saving (even if sequential stopped early, saved vs N bash calls)
-			if (raw.length > 1 && stoppedAt == null) {
-				// callsSaved already includes dedup adjustment; for early-stop we still saved the attempted batch
-			}
-			piRef.appendEntry("smart-tools:smart_bash", { commands: raw.length, unique: uniqueCount, parallel, stoppedAt, at: Date.now(), ms: all.reduce((s, r) => s + (r.ms || 0), 0) });
-			syncSmartUI(ctx);
-			const ok = all.every((r) => r.exitCode === 0 || r.dedup);
-			const totalMs = all.reduce((s, r) => s + (r.ms || 0), 0);
-			const totalChars = all.reduce((s, r) => s + (r.stdout?.length || 0), 0);
-			const header = `smart_bash ${raw.length} cmd(s)${parallel ? " (parallel)" : ""}${stoppedAt != null ? ` stoppedAt:${stoppedAt}` : ""} total:${totalMs}ms chars:${formatSize(totalChars)}${dedupSkipped.length ? ` dedup:${dedupSkipped.length}` : ""} ${ok ? "✓" : "✗"}`;
-			const body = all.map((r) => {
-				const tag = r.dedup ? "≡" : (r.exitCode === 0 ? "✓" : r.timedOut ? "⏱" : "✗");
-				const head = `[${r.idx}] ${tag} (${r.ms}ms exit:${r.exitCode}${r.truncated ? " truncated" : ""}${r.timedOut ? " timeout" : ""}) $ ${r.cmd}`;
-				const out = r.stdout ? `\n${r.stdout}` : "\n(no output)";
-				return `${head}${out}`;
-			}).join("\n\n---\n\n");
-			const combined = `${header}\n${"─".repeat(40)}\n${body}`;
-			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-			const text = trunc.truncated ? `${trunc.content}\n\n[Output truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)} — narrow commands with head/tail]` : trunc.content;
-			return { content: [{ type: "text", text }], details: { commands: raw, results: all, ok, stoppedAt, totalMs, totalChars, dedupSkipped, parallel } };
-		},
-		renderCall(args, theme) {
-			const n = (args.commands as any[]).length;
-			const first = (args.commands as any[]).slice(0,2).map((c:any)=> typeof c==="string"?c:(c as any).cmd).join(" | ").slice(0,60);
-			let t = theme.fg("toolTitle", theme.bold("smart_bash ")) + theme.fg("muted", `${n} cmd(s)`);
-			if (first) t += theme.fg("dim", `: ${first}`) + (n>2?theme.fg("dim", ` +${n-2} more`):"");
-			if ((args as any).parallel) t += theme.fg("dim", " parallel");
-			if ((args as any).stopOnError === false) t += theme.fg("dim", " no-stop");
-			return new Text(t, 0, 0);
-		},
-		renderResult(result, opts, theme) {
-			const d = result.details as any;
-			const ok = d?.ok;
-			let t = `${theme.fg(ok ? "success" : "warn", ok ? "✓" : "✗")} ${theme.fg("accent", `${d?.results?.length ?? 0} cmd(s)`)}`;
-			if (d?.totalMs != null) t += theme.fg("dim", ` ${d.totalMs}ms`);
-			if (d?.dedupSkipped?.length) t += theme.fg("dim", ` ≡${d.dedupSkipped.length}`);
-			if (d?.stoppedAt != null) t += theme.fg("warning", ` stopped@${d.stoppedAt}`);
-			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else if (d?.results) {
-				t += `\n${d.results.slice(0, 4).map((r: any) => {
-					const preview = (r.stdout||"").split("\n")[0].slice(0,60).replace(/\s+/g," ");
-					const tag = r.dedup ? "≡" : (r.exitCode===0?"✓":r.timedOut?"⏱":"✗");
-					return ` ${theme.fg(r.exitCode === 0 && !r.dedup ? "muted" : r.dedup ? "dim" : "warning", `[${r.idx}] ${tag} ${r.cmd.slice(0, 40)} → ${r.exitCode}` + (preview?` ${theme.fg("dim", `"${preview}"`)}`:""))}`;
-				}).join("\n")}${d.results.length > 4 ? `\n ${theme.fg("dim", `+${d.results.length - 4} more`)}` : ""}`;
-				t += `\n ${theme.fg("dim", "what happened: " + (d?.results?.filter((r:any)=>!r.dedup).length??0) + " cmd(s) executed" + (d?.dedupSkipped?.length?`, ${d.dedupSkipped.length} dedup` : "") + (d?.stoppedAt!=null?` (stopped @${d.stoppedAt})`:""))}`;
-			}
-			return new Text(t, 0, 0);
-		},
-	});
-
 	// ---- search_smart_tools — deferred loader (generic)
 	const searchSmartToolsTool = defineTool({
 		name: "search_smart_tools",
@@ -1061,7 +908,6 @@ export default function smartTools(pi: ExtensionAPI): void {
 	pi.registerTool(smartEditTool);
 	pi.registerTool(smartReadTool);
 	pi.registerTool(smartWriteTool);
-	pi.registerTool(smartBashTool);
 	pi.registerTool(smartGrepTool);
 	pi.registerTool(smartPatchTool);
 	pi.registerTool(searchSmartToolsTool);
@@ -1132,7 +978,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 			const lines = [
 				`smart-tools status — ${describeSmart()}`,
 				`  edits: ${state.smartEdits}  reads: ${state.smartReads} (hits:${state.cacheHits} miss:${state.cacheMisses})  writes:${state.smartWrites} (dedup:${state.dedupSkipped})`,
-				`  grep:${state.smartGreps}  patch:${state.smartPatches}  bash:${state.smartBashes}  searches:${state.searches}`,
+				`  grep:${state.smartGreps}  patch:${state.smartPatches}  searches:${state.searches}`,
 				`  saved: ${state.callsSaved} calls ~${estimateTokens(state.tokensSavedEst*4)} tokens  bash injected:${state.bashInjected} timeouts:${state.timeoutsDetected}`,
 				`  cache: ${readCache.size}/${CACHE_MAX} entries  TTL 5min`,
 				`  widget: /smart-history for recent ops`,
@@ -1161,7 +1007,6 @@ export default function smartTools(pi: ExtensionAPI): void {
 		state.smartWrites = 0;
 		state.smartGreps = 0;
 		state.smartPatches = 0;
-		state.smartBashes = 0;
 		state.searches = 0;
 		// keep cumulative counters across restarts from entries
 		let recoveredSaved = 0;
@@ -1172,15 +1017,12 @@ export default function smartTools(pi: ExtensionAPI): void {
 				if (entry.customType === "smart-tools:smart_write") state.smartWrites += 1;
 				if (entry.customType === "smart-tools:smart_grep") state.smartGreps += 1;
 				if (entry.customType === "smart-tools:smart_patch") state.smartPatches += 1;
-				if (entry.customType === "smart-tools:smart_bash") state.smartBashes += 1;
 				if (entry.customType === "smart-tools:search_smart_tools") state.searches += 1;
 				// approx saved: sum of batched counts (heuristic)
 				const d: any = (entry as any).data ?? {};
 				if (d.edits && d.edits > 1) recoveredSaved += (d.edits - 1);
 				if (Array.isArray(d.files) && d.files.length > 1) recoveredSaved += (d.files.length - 1);
 				if (Array.isArray(d.writes) && d.writes.length > 1) recoveredSaved += (d.writes.length - 1);
-				if (d.commands && d.commands > 1) recoveredSaved += (d.commands - 1);
-				if (typeof d.unique === "number" && d.commands && d.unique < d.commands) recoveredSaved += (d.commands - d.unique);
 			}
 		}
 		if (recoveredSaved) state.callsSaved = recoveredSaved;
@@ -1206,7 +1048,6 @@ export default function smartTools(pi: ExtensionAPI): void {
 		state.smartWrites = 0;
 		state.smartGreps = 0;
 		state.smartPatches = 0;
-		state.smartBashes = 0;
 		state.searches = 0;
 		state.callsSaved = 0;
 		state.cacheHits = 0;
