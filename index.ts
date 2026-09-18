@@ -173,6 +173,32 @@ function normalizeGrepKey(query: string, globs?: string[]): string {
 	const g = (globs ?? []).slice(0,5).join(",");
 	return `${n}::${g}`;
 }
+// ---------------------------------------------------------------------------
+// Failure helpers — why failed + retry (AI-visible)
+// ---------------------------------------------------------------------------
+function failBlock(tool: string, why: string, retry: string, extra?: string): string {
+	const lines = [`✗ ${tool} FAILED`, `Why failed: ${why}`, `Retry: ${retry}`];
+	if (extra) lines.push(extra);
+	return lines.join("\n");
+}
+function classifyFsError(e: any, path: string): { why: string; retry: string } {
+	const code = (e as any)?.code ?? "";
+	const msg = String(e?.message ?? e).slice(0, 300);
+	if (code === "ENOENT") return { why: `File not found: ${path} — ${msg}`, retry: `Verify path relative to cwd exists. List files with bash ls, then retry smart_read with correct path. For new file, use smart_write or smart_edit with createIfMissing:true.` };
+	if (code === "EACCES" || code === "EPERM") return { why: `Permission denied: ${path} — ${msg}`, retry: `Check file permissions (bash ls -l). Retry after fixing permissions or choose writable path.` };
+	if (code === "EISDIR") return { why: `Path is a directory, not a file: ${path}`, retry: `Provide file path, not directory. Use bash ls to list files inside.` };
+	if (code === "ENOTDIR") return { why: `Invalid path component (not a directory): ${path}`, retry: `Check parent directory exists. Create missing dirs via smart_write (auto mkdir) or bash mkdir -p.` };
+	return { why: `${path}: ${msg}`, retry: `Re-read with smart_read to verify content, check path and permissions, then retry.` };
+}
+function retryHintForRead(file: string): string {
+	return `Retry: smart_read {files: ["${file}"]} with correct relative path; if large, add offset/limit; if binary add encoding:"base64". Verify cwd first.`;
+}
+function retryHintForEdit(): string {
+	return `Retry: smart_read the file first, copy exact 3-6 line anchor including unique symbol (function name/import/string), then smart_edit with that exact oldText. Use dryRun:true to validate, strict:false if fuzzy needed. Merge overlapping edits into one.`;
+}
+function retryHintForWrite(path: string): string {
+	return `Retry: check path "${path}" is relative to cwd and parent dir writable. Use smart_write {writes:[{path:"${path}", content:"..."}]} again. For no-op skip, content hash must differ.`;
+}
 function flushTelemetry(piRef:any): void {
 	if (!pendingTelemetry.length) return;
 	const batch = [...pendingTelemetry];
@@ -260,7 +286,7 @@ function validateEdits(content: string, edits: Array<{oldText:string;newText:str
 	const missing: ValidatedEdit[] = [];
 	for (let i=0;i<edits.length;i++) {
 		const e = edits[i];
-		if (e.oldText.length > MAX_OLDTEXT) throw new Error(`smart_edit: oldText too large (${e.oldText.length} > ${MAX_OLDTEXT}). Use a shorter unique anchor (3-6 lines).`);
+		if (e.oldText.length > MAX_OLDTEXT) throw new Error(failBlock("smart_edit", `oldText too large (${e.oldText.length} > ${MAX_OLDTEXT})`, `Use a shorter unique anchor (3-6 lines) with unique symbol. Split large block into smaller edits.`, `--- oldText length ${e.oldText.length} ---`));
 		if (e.oldText === "") {
 			resolved.push({ index:i, oldText:e.oldText, newText:e.newText, hit:{ idx: content.length, confidence:1, strategy:"append", startLine: content.split("\n").length, endLine: content.split("\n").length, length:0 }, found:true, isAppend:true });
 			continue;
@@ -301,17 +327,23 @@ function applyEditsAtomic(content: string, edits: Array<{oldText:string;newText:
 		const m = v.missing[0];
 		const preview = getNearbyPreview(content, null, m.oldText);
 		const hint = m.oldText.length > 400 ? "Hint: use a shorter unique anchor (3-6 lines) instead of a large block." : "Hint: re-read the file and copy the exact block (including indentation). Anchor = 3-6 lines, must include unique symbol.";
-		throw new Error(`smart_edit: oldText not found (edit ${m.index}). Tried exact + line-trim + collapsed.\n--- missing oldText (first 500) ---\n${m.oldText.slice(0,500)}\n--- nearby preview ---\n${preview}\n---\n${hint}\nIf you used offset/limit, the slice may not contain the anchor — read a wider window.`);
+		throw new Error(failBlock("smart_edit", `oldText not found (edit ${m.index}) — tried exact + line-trim + collapsed`, `${hint} ${retryHintForEdit()} If you used offset/limit, read a wider window.`, `--- missing oldText (first 500) ---
+${m.oldText.slice(0,500)}
+--- nearby preview ---
+${preview}`));
 	}
 	if (v.overlaps.length > 0) {
 		const list = v.overlaps.map(([a,b])=>`${a}↔${b}`).join(", ");
-		throw new Error(`smart_edit: overlapping edits against original file (same line mutated twice): ${list}. Edits must be non-overlapping when matched against the original content. Merge overlapping edits into one. Dedup identical edits first.`);
+		throw new Error(failBlock("smart_edit", `overlapping edits same line mutated twice: ${list}`, `Merge overlapping edits into one edit entry covering single region. Dedup identical oldText/newText. Each edits[].oldText must be unique and non-overlapping against original file.`));
 	}
 	if (opts.strict && v.lowConfidence.length > 0) {
 		const low = v.lowConfidence[0];
 		const preview = getNearbyPreview(content, low.hit, low.oldText);
 		const sugg = suggestedOldText(content, low.hit);
-		throw new Error(`smart_edit: strict mode rejected fuzzy match (edit ${low.index} confidence ${low.hit!.confidence} strategy ${low.hit!.strategy}).\n--- suggested exact oldText ---\n${sugg.slice(0,600)}\n--- nearby preview ---\n${preview}\n---\nRe-read and use the suggested exact block, or retry with strict:false.`);
+		throw new Error(failBlock("smart_edit", `strict mode rejected fuzzy match (edit ${low.index} confidence ${low.hit!.confidence} strategy ${low.hit!.strategy})`, `Re-read and use suggested exact block verbatim, or retry with strict:false.`, `--- suggested exact oldText ---
+${sugg.slice(0,600)}
+--- nearby preview ---
+${preview}`));
 	}
 	const seen = new Set<string>();
 	const deduped: ValidatedEdit[] = [];
@@ -529,7 +561,7 @@ async function doSmartReadFiles(entries: any[], cwd: string, onUpdate?: (m:any)=
 			const cappedNote = trunc.truncated ? ` [capped ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)} — rerun with offset/limit or fewer files]` : "";
 			const hitTag = fromCache ? " cached" : "";
 			return `## ${file} (${headerLinesInfo} ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}${hitTag})\n${trunc.content}${cappedNote}`;
-		} catch (e:any) { return `## ${file}: ${(e as Error).message.slice(0, 700)}`; }
+		} catch (e:any) { const cls = classifyFsError(e, file); return failBlock("smart_read", cls.why, cls.retry, `## ${file}: ${(e as Error).message.slice(0, 400)}`); }
 	}));
 	const perFileBudget = Math.floor(budget / Math.max(1, entries.length));
 	return { texts, cacheHits, perFileBudget };
@@ -627,7 +659,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 				usedCacheForEdit = true;
 			} else {
 				try { current = await readFile(target, "utf8"); } catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT" || params.createIfMissing === false) throw error;
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT" || params.createIfMissing === false) { const cls = classifyFsError(error, params.path); throw new Error(failBlock("smart_edit", cls.why, cls.retry)); }
 					current = ""; existed = false;
 				}
 			}
@@ -668,21 +700,27 @@ export default function smartTools(pi: ExtensionAPI): void {
 				if (validation!.missing.length > 0) {
 					const m = validation!.missing[0];
 					const preview = getNearbyPreview(current, null, m.oldText);
-					throw new Error(`smart_edit: oldText not found (edit ${m.index}) after auto-rescue. Tried exact + line-trim + collapsed.\n--- missing oldText (first 500) ---\n${m.oldText.slice(0,500)}\n--- nearby preview ---\n${preview}\n---\nHint: re-read the file and copy the exact block (including indentation). Anchor 3-6 lines with unique symbol.`);
+					throw new Error(failBlock("smart_edit", `oldText not found (edit ${m.index}) after auto-rescue — tried exact + line-trim + collapsed`, `${retryHintForEdit()} Copy exact block including indentation. Anchor 3-6 lines with unique symbol.`, `--- missing oldText (first 500) ---
+${m.oldText.slice(0,500)}
+--- nearby preview ---
+${preview}`));
 				}
 			} else if (validation.missing.length > 0 && usedCacheForEdit) {
 				try {
 					const fresh = await readFile(target, "utf8");
 					const v2 = validateEdits(fresh, params.edits);
 					if (v2.missing.length === 0) { current = fresh; validation = v2; }
-					else { const m = v2.missing[0]; const preview = getNearbyPreview(fresh, null, m.oldText); throw new Error(`smart_edit: oldText not found (edit ${m.index}) even after cache rescue.\n--- preview ---\n${preview}`); }
+					else { const m = v2.missing[0]; const preview = getNearbyPreview(fresh, null, m.oldText); throw new Error(failBlock("smart_edit", `oldText not found (edit ${m.index}) even after cache rescue`, retryHintForEdit(), `--- preview ---
+${preview}
+--- missing oldText ---
+${m.oldText.slice(0,400)}`)); }
 				} catch (e) { throw e; }
 			}
 			return withFileMutationQueue(target, async () => {
 				await mkdir(dirname(target), { recursive: true });
 				let curInside = current;
 				try { curInside = await readFile(target, "utf8"); } catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT" || params.createIfMissing === false) throw error;
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT" || params.createIfMissing === false) { const cls = classifyFsError(error, params.path); throw new Error(failBlock("smart_edit", cls.why, cls.retry)); }
 					curInside = "";
 				}
 				let next: string; let applied: ValidatedEdit[]; let dedupSkipped = 0; let lowConfidence: ValidatedEdit[] = [];
@@ -840,8 +878,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 						state.dedupSkipped += 1;
 						return;
 					}
-					await mkdir(dirname(target), { recursive: true });
-					await writeFile(target, w.content, "utf8");
+					try { await mkdir(dirname(target), { recursive: true }); await writeFile(target, w.content, "utf8"); } catch (e:any) { const cls = classifyFsError(e, w.path); throw new Error(failBlock("smart_write", cls.why, cls.retry)); }
 					readCache.delete(w.path); readCache.delete(target); grepCache.clear();
 					results.push({ path: w.path, bytes: w.content.length });
 				});
@@ -955,8 +992,8 @@ export default function smartTools(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			onUpdate?.({ message: "smart_patch: checking patch" } as any);
 			const patch = params.patch;
-			if (!patch || patch.trim().length < 10) throw new Error("smart_patch: patch too short or empty");
-			if (patch.length > 500_000) throw new Error("smart_patch: patch too large (>500KB), split into smaller patches");
+			if (!patch || patch.trim().length < 10) throw new Error(failBlock("smart_patch", "patch too short or empty", "Provide valid unified diff (git diff format) with at least 10 chars. Verify patch content is not truncated."));
+			if (patch.length > 500_000) throw new Error(failBlock("smart_patch", "patch too large (>500KB)", "Split into smaller patches <=500KB or use smart_edit/smart_bundle for large changes."));
 			const fileCount = (patch.match(/^\+\+\+ b\//gm)||[]).length;
 			const hunkCount = (patch.match(/^@@/gm)||[]).length;
 			const tmp = join(tmpdir(), `smart-patch-${randomUUID()}.patch`);
@@ -1038,10 +1075,10 @@ export default function smartTools(pi: ExtensionAPI): void {
 			const hasGreps = params.greps && params.greps.length>0;
 			const hasEdits = params.edits && params.edits.length>0;
 			const hasWrites = params.writes && params.writes.length>0;
-			if (!hasReads && !hasGreps && !hasEdits && !hasWrites) throw new Error("smart_bundle: at least one of reads/greps/edits/writes required");
-			if (params.reads && params.reads.length> BUNDLE_MAX) throw new Error(`smart_bundle: reads max ${BUNDLE_MAX}`);
-			if (params.edits && params.edits.length> BUNDLE_MAX) throw new Error(`smart_bundle: edits max ${BUNDLE_MAX} files`);
-			if (params.writes && params.writes.length> BUNDLE_MAX) throw new Error(`smart_bundle: writes max ${BUNDLE_MAX}`);
+			if (!hasReads && !hasGreps && !hasEdits && !hasWrites) throw new Error(failBlock("smart_bundle", "at least one of reads/greps/edits/writes required", "Provide at least one operation: e.g. smart_bundle {reads:[{path:\"src/app.ts\"}]} or {edits:[{path:\"a.ts\", edits:[{oldText:\"x\", newText:\"y\"}]}]}"));
+			if (params.reads && params.reads.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `reads max ${BUNDLE_MAX} exceeded (${params.reads.length})`, `Reduce reads to <=${BUNDLE_MAX} per call. Split into multiple smart_bundle calls.`));
+			if (params.edits && params.edits.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `edits max ${BUNDLE_MAX} files exceeded`, `Reduce edits to <=${BUNDLE_MAX} files per call. Split large refactor into multiple calls.`));
+			if (params.writes && params.writes.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `writes max ${BUNDLE_MAX} exceeded`, `Reduce writes to <=${BUNDLE_MAX} per call.`));
 			const sections: string[] = [];
 			const bundleDetails: any = {};
 			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
@@ -1087,8 +1124,8 @@ export default function smartTools(pi: ExtensionAPI): void {
 								let cur = ""; try { cur = await readFile(target, "utf8"); } catch (e:any) { if ((e as NodeJS.ErrnoException).code !== "ENOENT" || ef.createIfMissing === false) throw e; cur = ""; }
 								let v = validateEdits(cur, ef.edits);
 								if (v.missing.length) { try { const fresh = await readFile(target, "utf8"); if (fresh !== cur) { const v2 = validateEdits(fresh, ef.edits); if (v2.missing.length < v.missing.length) { cur = fresh; v = v2; } } } catch {} }
-								if (v.missing.length) throw new Error(`smart_bundle edit ${ef.path}: oldText not found ${v.missing.map(m=>m.index).join(",")} — ${getNearbyPreview(cur, null, v.missing[0].oldText).slice(0,400)}`);
-								if (v.overlaps.length) throw new Error(`smart_bundle edit ${ef.path}: overlapping edits same line ${v.overlaps.map(([a,b])=>`${a}<->${b}`).join(",")}`);
+								if (v.missing.length) throw new Error(failBlock("smart_bundle", `oldText not found in ${ef.path} (edits ${v.missing.map(m=>m.index).join(",")})`, `${retryHintForEdit()} — re-read file and fix anchor.`, `${getNearbyPreview(cur, null, v.missing[0].oldText).slice(0,400)}`));
+								if (v.overlaps.length) throw new Error(failBlock("smart_bundle", `overlapping edits in ${ef.path}: ${v.overlaps.map(([a,b])=>`${a}<->${b}`).join(",")}`, `Merge overlapping edits into one. Each edits[].oldText must be non-overlapping against original.`));
 								const { next, applied, dedupSkipped, lowConfidence } = applyEditsAtomic(cur, ef.edits, { strict: params.strict });
 								if (next === cur) { editResults.push({ path: ef.path, applied: 0, bytes: cur.length, dedup: dedupSkipped, noOp:true }); state.dedupSkipped += dedupSkipped || 1; return; }
 								await mkdir(dirname(target), { recursive: true }); await writeFile(target, next, "utf8");
@@ -1256,6 +1293,30 @@ export default function smartTools(pi: ExtensionAPI): void {
 			};
 		}
 		return undefined;
+	});
+
+	// Smart-tools failure enrichment — ensure why+retry visible
+	pi.on("tool_result", async (event, _ctx) => {
+		const name = (event as any).toolName ?? "";
+		if (!String(name).startsWith("smart_")) return undefined;
+		const content = (event.content?.[0] as any)?.text ?? "";
+		const isError = (event as any).isError || content.includes("FAILED") || content.includes("Error") || content.includes("failed");
+		if (!isError) return undefined;
+		if (content.includes("Why failed:") && content.includes("Retry:")) return undefined;
+		const retryMap: Record<string,string> = {
+			smart_read: 'Retry: smart_read {files:["<path>"]} — verify path, use offset/limit, encoding:"base64" for binary.',
+			smart_write: 'Retry: smart_write {writes:[{path:"<path>", content:"..."}]} — check path relative to cwd, parent dir writable.',
+			smart_edit: 'Retry: ' + "smart_read first, copy exact 3-6 line anchor with unique symbol, then smart_edit with that oldText. Use dryRun:true to validate.",
+			smart_bundle: 'Retry: use smart_bundle {reads:[...], edits:[...]} with dryRun:true to validate before applying. Check each section error.',
+			smart_grep: 'Retry: smart_grep {query:"<pattern>", globs:["*.ts"]} — check regex syntax, reduce maxResults, add globs.',
+			smart_patch: 'Retry: ensure patch is valid unified diff (git diff) and file paths match. Fallback to smart_edit with anchors.'
+		};
+		const retry = retryMap[name] ?? 'Retry: re-read relevant files, fix anchor/path, then retry the operation.';
+		const why = content.slice(0, 500).replace(/\n/g, " ");
+		return {
+			content: [{ type: "text", text: content + "\n\n" + failBlock(name, why || "operation failed", retry) }],
+			details: { ...(event.details as any), smartToolsEnriched: true }
+		};
 	});
 
 	// -----------------------------------------------------------------------
