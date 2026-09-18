@@ -666,7 +666,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 			try { const st = await stat(target); mtimeMs = (st as any).mtimeMs; sz = (st as any).size; } catch {}
 			const cached = readCache.get(params.path) ?? readCache.get(target);
 			let usedCacheForEdit = false;
-			if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz) && params.edits.every(e=> !e.oldText || cached.content.includes(e.oldText.split("\n")[0]?.trim().slice(0,24) || ""))) {
+			if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz) && params.edits.every((e: any)=> !e.oldText || cached.content.includes(e.oldText.split("\n")[0]?.trim().slice(0,24) || ""))) {
 				current = cached.content;
 				usedCacheForEdit = true;
 			} else {
@@ -677,7 +677,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 			}
 			let validation: ValidateResult | null = null;
 			try { validation = validateEdits(current, params.edits); } catch (e) { throw e; }
-			const allNoop = params.edits.length>0 && params.edits.every(e=>e.oldText===e.newText);
+			const allNoop = params.edits.length>0 && params.edits.every((e: any)=>e.oldText===e.newText);
 			if (allNoop) {
 				state.dedupSkipped += 1;
 				state.smartEdits += 1;
@@ -829,7 +829,7 @@ ${m.oldText.slice(0,400)}`)); }
 		],
 		parameters: smartReadParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const entries = params.files.slice(0, 8).map((f) => typeof f === "string" ? { path: f, offset: undefined as number|undefined, limit: undefined as number|undefined, encoding: "utf8" as const } : { path: (f as any).path, offset: (f as any).offset, limit: (f as any).limit, encoding: ((f as any).encoding ?? "utf8") as "utf8"|"base64" });
+			const entries = params.files.slice(0, 8).map((f: any) => typeof f === "string" ? { path: f, offset: undefined as number|undefined, limit: undefined as number|undefined, encoding: "utf8" as const } : { path: (f as any).path, offset: (f as any).offset, limit: (f as any).limit, encoding: ((f as any).encoding ?? "utf8") as "utf8"|"base64" });
 			const { texts: reads, cacheHits: cacheHitsThisCall, perFileBudget } = await doSmartReadFiles(entries, ctx.cwd, onUpdate as any);
 			state.smartReads += 1;
 			if (cacheHitsThisCall) state.cacheHits += cacheHitsThisCall; else state.cacheMisses += entries.length;
@@ -839,7 +839,7 @@ ${m.oldText.slice(0,400)}`)); }
 			const combined = reads.join("\n\n---\n\n");
 			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 			const text = trunc.truncated ? `${trunc.content}\n\n[Output truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)} — rerun with fewer files or offset/limit]` : trunc.content;
-			return { content: [{ type: "text", text }], details: { files: entries.map(e=> typeof e==="string"? e : e.path), count: entries.length, cacheHits: cacheHitsThisCall, perFileBudget } };
+			return { content: [{ type: "text", text }], details: { files: entries.map((e: any)=> typeof e==="string"? e : e.path), count: entries.length, cacheHits: cacheHitsThisCall, perFileBudget } };
 		},
 		renderCall(args, theme) {
 			const n = (args.files as any[]).length;
@@ -879,7 +879,7 @@ ${m.oldText.slice(0,400)}`)); }
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const writes = params.writes.slice(0, 8);
 			const results: Array<{path:string; bytes:number; skipped?:boolean; reason?:string}> = [];
-			await Promise.all(writes.map(async (w, idx) => {
+			await Promise.all(writes.map(async (w: any, idx: number) => {
 				const target = resolveInsideCwd(ctx.cwd, w.path);
 				onUpdate?.({ message: `smart_write ${idx+1}/${writes.length}: ${w.path}` } as any);
 				return withFileMutationQueue(target, async () => {
@@ -895,17 +895,17 @@ ${m.oldText.slice(0,400)}`)); }
 					results.push({ path: w.path, bytes: w.content.length });
 				});
 			}));
-			results.sort((a,b)=> writes.findIndex(w=>w.path===a.path) - writes.findIndex(w=>w.path===b.path));
+			results.sort((a,b)=> writes.findIndex((w: any)=>w.path===a.path) - writes.findIndex((w: any)=>w.path===b.path));
 			state.smartWrites += 1;
 			if (writes.length > 1) { state.callsSaved += (writes.length - 1); state.tokensSavedEst += estimateTokens(writes.length * 500); }
-			scheduleTelemetry(piRef, "smart-tools:smart_write", { writes: writes.map((w) => w.path), at: Date.now(), skipped: results.filter(r=>r.skipped).length });
+			scheduleTelemetry(piRef, "smart-tools:smart_write", { writes: writes.map((w: any) => w.path), at: Date.now(), skipped: results.filter((r: any)=>r.skipped).length });
 			syncSmartUI(ctx);
 			const skipped = results.filter(r=>r.skipped);
 			const written = results.filter(r=>!r.skipped);
 			const summary = `smart_write ${writes.length} file(s): ${written.map(r=>`${r.path}: ${r.bytes} bytes`).join(", ") || "none written"}${skipped.length?` — skipped ${skipped.length} no-op: ${skipped.map(r=>r.path).join(", ")}`:""}`;
 			const trunc = truncateHead(summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 			const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}]` : trunc.content;
-			return { content: [{ type: "text", text }], details: { writes: writes.map((w) => w.path), count: writes.length, skipped: skipped.map(s=>s.path), written: written.map(w=>w.path) } };
+			return { content: [{ type: "text", text }], details: { writes: writes.map((w: any) => w.path), count: writes.length, skipped: skipped.map((s: any)=>s.path), written: written.map((w: any)=>w.path) } };
 		},
 		renderCall(args, theme) {
 			const preview = args.writes.slice(0,2).map((w:any)=>w.path).join(", ");
@@ -1104,12 +1104,12 @@ ${m.oldText.slice(0,400)}`)); }
 			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
 			if (hasGreps) {
 				onUpdate?.({ message: `smart_bundle: ${params.greps!.length} grep(s)` } as any);
-				const grepResults = await Promise.all(params.greps!.map(async (g)=>{
+				const grepResults = await Promise.all(params.greps!.map(async (g: any)=>{
 					const r = await doGrepOne(g.query, Math.min(100, g.maxResults ?? 30), g.globs, ctx.cwd);
 					return { query: g.query, hits: r.hits, engine: r.engine };
 				}));
 				state.smartGreps += grepResults.length;
-				bundleDetails.greps = grepResults.map(r=> ({ query:r.query, count:r.hits.length, engine:r.engine }));
+				bundleDetails.greps = grepResults.map((r: any)=> ({ query:r.query, count:r.hits.length, engine:r.engine }));
 				sections.push(`--- bundle greps (${grepResults.length}) ---`);
 				for (const r of grepResults) { sections.push(`query "${r.query}" via ${r.engine}: ${r.hits.length} hits`); if (r.hits.length) sections.push(r.hits.slice(0,5).map((h:any)=> `  ${h.file}:${h.line}: ${h.preview.slice(0,120)}`).join("\n")); }
 			}
@@ -1137,7 +1137,7 @@ ${m.oldText.slice(0,400)}`)); }
 						sections.push(`dryRun ${ef.path}: ${wouldApply?"✓ would apply":"✗ would fail"} — ${ef.edits.length} edit(s) overlaps:${v.overlaps.length} missing:${v.missing.length}`);
 					}
 				} else {
-					await Promise.all(params.edits!.map(async (ef)=>{
+					await Promise.all(params.edits!.map(async (ef: any)=>{
 						const target = resolveInsideCwd(ctx.cwd, ef.path);
 						try {
 							await withFileMutationQueue(target, async()=>{
@@ -1157,7 +1157,7 @@ ${m.oldText.slice(0,400)}`)); }
 					}));
 					if (editFail) throw editFail;
 					state.smartEdits += params.edits!.length;
-					const totalEdits = params.edits!.reduce((s,ef)=>s+ef.edits.length,0);
+					const totalEdits = params.edits!.reduce((s: number,ef: any)=>s+ef.edits.length,0);
 					if (totalEdits > params.edits!.length) { state.callsSaved += (totalEdits - params.edits!.length); }
 					if (params.edits!.length > 1) { state.callsSaved += (params.edits!.length - 1); }
 				}
@@ -1169,7 +1169,7 @@ ${m.oldText.slice(0,400)}`)); }
 				onUpdate?.({ message: `smart_bundle: ${params.writes!.length} write(s)` } as any);
 				const writes = params.writes!.slice(0, BUNDLE_MAX);
 				const results: Array<{path:string; bytes:number; skipped?:boolean}> = [];
-				await Promise.all(writes.map(async (w)=>{
+				await Promise.all(writes.map(async (w: any)=>{
 					const target = resolveInsideCwd(ctx.cwd, w.path);
 					return withFileMutationQueue(target, async()=>{
 						let existing: string|null=null; try { existing = await readFile(target,"utf8"); } catch {}
@@ -1226,7 +1226,7 @@ ${m.oldText.slice(0,400)}`)); }
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const terms = params.query.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 			const candidates = pi.getAllTools().filter(t=> SEARCHABLE_TOOL_NAMES.has(t.name));
-			const scored = candidates.map(tool=> ({ tool, score: terms.reduce((s,term)=> s + (`${tool.name} ${tool.description}`.toLowerCase().includes(term)?1:0), 0) })).filter(m=>m.score>0).sort((a,b)=>b.score-a.score).slice(0, params.limit ?? 3).map(m=>m.tool.name);
+			const scored = candidates.map((tool: any)=> ({ tool, score: terms.reduce((s: number,term: string)=> s + (`${tool.name} ${tool.description}`.toLowerCase().includes(term)?1:0), 0) })).filter((m: any)=>m.score>0).sort((a: any,b: any)=>b.score-a.score).slice(0, params.limit ?? 3).map((m: any)=>m.tool.name);
 			if (scored.length===0) {
 				const q = params.query.toLowerCase();
 				if (q.includes("grep")||q.includes("search")||q.includes("find")) scored.push("smart_grep");
