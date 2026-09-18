@@ -23,10 +23,11 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "files": ["index.ts", "README.md", "dist"],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "typebox": "^1.3.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",
@@ -36,7 +37,10 @@
     "typescript": "^5"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit --skipLibCheck",
-    "check": "tsc --noEmit --skipLibCheck"
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit",
+    "build": "tsc --outDir dist",
+    "prepare": "npm run build",
+    "lint": "tsc --noEmit --skipLibCheck"
   }
 }

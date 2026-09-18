@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * smart-tools v3.0 — batching + fuzzy edits + productivity suite
  *
@@ -32,17 +31,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile, stat } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { type Static, Type } from "typebox";
 import { createHash } from "node:crypto";
-import { execFile as execFileCb, exec as execCb } from "node:child_process";
+import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const execFile = promisify(execFileCb);
-const exec = promisify(execCb);
 
 // ---------------------------------------------------------------------------
 // State + telemetry + caches
@@ -98,7 +96,15 @@ let pendingTelemetry: Array<{type:string;data:any}> = [];
 let telemetryTimer: any = null;
 
 function hashContent(s: string): string {
-	return createHash("sha1").update(s, "utf8").digest("hex").slice(0, 12);
+	return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
+}
+function resolveInsideCwd(cwd: string, p: string): string {
+	const target = resolve(cwd, p);
+	const root = resolve(cwd) + sep;
+	if (target !== resolve(cwd) && !target.startsWith(root)) {
+		throw new Error(failBlock("smart-tools", `Path traversal blocked: "${p}" escapes cwd`, `Use a path inside the workspace. cwd=${cwd}`));
+	}
+	return target;
 }
 function estimateTokens(bytes: number): number { return Math.ceil(bytes / 4); }
 function renderStatus(theme: any): string {
@@ -158,8 +164,14 @@ function touchCacheEvict(): void {
 }
 function isCacheValid(entry: CacheEntry, mtimeMs: number, size?: number): boolean {
 	if (Date.now() - entry.at >= CACHE_TTL_MS) return false;
+	// mtime can be stale within 1ms on fast writes; size is primary, hash checked on read path
 	if (Math.abs(entry.mtimeMs - mtimeMs) > 1) return false;
 	if (size != null && entry.size !== size) return false;
+	return true;
+}
+function isCacheValidWithHash(entry: CacheEntry, mtimeMs: number, size: number, freshHash?: string): boolean {
+	if (!isCacheValid(entry, mtimeMs, size)) return false;
+	if (freshHash && entry.hash !== freshHash) return false;
 	return true;
 }
 function touchGrepCacheEvict(): void {
@@ -501,7 +513,7 @@ async function doSmartReadFiles(entries: any[], cwd: string, onUpdate?: (m:any)=
 	const sizes: number[] = [];
 	for (const e of entries) {
 		const p = typeof e === "string" ? e : e.path;
-		const abs = resolve(cwd, p);
+		const abs = resolveInsideCwd(cwd, p);
 		try { const st = await stat(abs); sizes.push((st as any).size || 4096); } catch { sizes.push(4096); }
 	}
 	const total = sizes.reduce((a,b)=>a+b,0) || entries.length*4096;
@@ -511,7 +523,7 @@ async function doSmartReadFiles(entries: any[], cwd: string, onUpdate?: (m:any)=
 		const offset = typeof entry === "string" ? undefined : entry.offset;
 		const limit = typeof entry === "string" ? undefined : entry.limit;
 		const encoding = typeof entry === "string" ? "utf8" : (entry.encoding ?? "utf8");
-		const abs = resolve(cwd, file);
+		const abs = resolveInsideCwd(cwd, file);
 		onUpdate?.({ message: `smart_read ${idx+1}/${entries.length}: ${file}` } as any);
 		try {
 			let mtimeMs = 0; let sz = 0;
@@ -582,7 +594,7 @@ async function doGrepOne(query:string, maxResults:number, globs:string[]|undefin
 		args.push("-e", query, ".");
 		const { stdout } = await execFile("rg", args, { cwd, maxBuffer: 2_000_000, timeout: 15000 } as any);
 		used = "rg";
-		hits = (stdout as string).split("\n").filter(Boolean).slice(0, maxResults).map(line=>{
+		hits = String(stdout).split("\n").filter(Boolean).slice(0, maxResults).map(line=>{
 			const m = line.match(/^([^:]+):(\d+):(.*)$/);
 			if (!m) return { file: line.slice(0,80), line: 0, preview: line.slice(0,240) };
 			return { file: m[1], line: parseInt(m[2],10), preview: m[3].slice(0, 240) };
@@ -594,13 +606,13 @@ async function doGrepOne(query:string, maxResults:number, globs:string[]|undefin
 				const grepArgs = ["-rn", "-m", String(maxResults), "--", query, "."];
 				const { stdout } = await execFile("grep", grepArgs, { cwd, maxBuffer: 2_000_000, timeout: 15000 } as any);
 				used = "grep";
-				hits = (stdout as string).split("\n").filter(Boolean).slice(0, maxResults).map(line=>{
+				hits = String(stdout).split("\n").filter(Boolean).slice(0, maxResults).map(line=>{
 					const m = line.match(/^\.\/([^:]+):(\d+):(.*)$/) || line.match(/^([^:]+):(\d+):(.*)$/);
 					if (!m) return { file: line.slice(0,80), line:0, preview: line.slice(0,240) };
 					return { file: m[1].replace(/^\.\//,""), line: parseInt(m[2],10), preview: m[3].slice(0,240) };
 				});
 			} catch (e2:any) {
-				const out = String(e2?.stdout ?? "");
+				const out = String((e2 as any)?.stdout ?? "");
 				if (out) {
 					used = "grep";
 					hits = out.split("\n").filter(Boolean).slice(0, maxResults).map(line=>{
@@ -647,7 +659,7 @@ export default function smartTools(pi: ExtensionAPI): void {
 		],
 		parameters: smartEditParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-			const target = resolve(ctx.cwd, params.path);
+			const target = resolveInsideCwd(ctx.cwd, params.path);
 			let current = "";
 			let existed = true;
 			let mtimeMs = 0, sz = 0;
@@ -760,23 +772,23 @@ ${m.oldText.slice(0,400)}`)); }
 		renderCall(args, theme) {
 			let t = theme.fg("toolTitle", theme.bold("smart_edit ")) + theme.fg("muted", args.path);
 			t += theme.fg("dim", ` ×${args.edits.length}`);
-			if ((args as any).dryRun) t += theme.fg("warn", " dryRun");
-			if ((args as any).strict) t += theme.fg("warn", " strict");
+			if ((args as any).dryRun) t += theme.fg("warning", " dryRun");
+			if ((args as any).strict) t += theme.fg("warning", " strict");
 			return new Text(t, 0, 0);
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
 			if (!d?.path) return new Text(theme.fg("dim", "smart_edit"), 0, 0);
 			if (d.dryRun) {
-				let text = `${theme.fg(d.wouldApply?"success":"warn", d.wouldApply?"✓ dryRun":"✗ dryRun")} ${theme.fg("accent", d.path)} ${theme.fg("dim", `${d.validation?.total ?? 0} edit(s)`)}`;
+				let text = `${theme.fg(d.wouldApply?"success":"warning", d.wouldApply?"✓ dryRun":"✗ dryRun")} ${theme.fg("accent", d.path)} ${theme.fg("dim", `${d.validation?.total ?? 0} edit(s)`)}`;
 				if (opts.expanded && d.validation) text += `\n ${theme.fg("dim", `overlaps:${d.validation.overlaps?.length ?? 0} missing:${d.validation.missing?.length ?? 0} low:${d.validation.lowConfidence?.length ?? 0}`)}`;
 				else text += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
 				return new Text(text, 0, 0);
 			}
-			let text = `${theme.fg(d.noOp?"warn":"success", d.noOp?"○":"✓")} ${theme.fg("accent", d.path)} ${theme.fg("dim", `${d.applied ?? 0} edit(s)`)}`;
+			let text = `${theme.fg(d.noOp?"warning":"success", d.noOp?"○":"✓")} ${theme.fg("accent", d.path)} ${theme.fg("dim", `${d.applied ?? 0} edit(s)`)}`;
 			if (d.bytesBefore != null && d.bytesAfter != null) { const delta = d.bytesAfter - d.bytesBefore; text += theme.fg("dim", ` ${d.bytesBefore}→${d.bytesAfter} (${delta>0?"+" : ""}${delta}B)`); }
 			if (d.dedupSkipped) text += theme.fg("dim", ` (+${d.dedupSkipped} dedup)`);
-			if (d.lowConfidence) text += theme.fg("warn", ` ⚠${d.lowConfidence} lowConf`);
+			if (d.lowConfidence) text += theme.fg("warning", ` ⚠${d.lowConfidence} lowConf`);
 			if (!opts.expanded) {
 				if (d.diff) {
 					let add = 0, rem = 0;
@@ -797,7 +809,7 @@ ${m.oldText.slice(0,400)}`)); }
 					else text += "\n" + theme.fg("dim", line);
 				}
 				if ((d.diff as string).split("\n").length > 30) text += "\n" + theme.fg("muted", "... " + ((d.diff as string).split("\n").length - 30) + " more diff lines");
-				if (d.suggestion?.length) text += "\n" + theme.fg("warn", "hint: low confidence - next time copy suggested block:") + "\n" + theme.fg("dim", JSON.stringify(d.suggestion).slice(0,400));
+				if (d.suggestion?.length) text += "\n" + theme.fg("warning", "hint: low confidence - next time copy suggested block:") + "\n" + theme.fg("dim", JSON.stringify(d.suggestion).slice(0,400));
 			} else {
 				if (d.strategies) text += "\n " + theme.fg("muted", (d.strategies as any[]).map((s:any)=>"#" + s.i + ":" + s.s + "(" + ((s.c*100)|0) + "%)").join(" "));
 			}
@@ -868,7 +880,7 @@ ${m.oldText.slice(0,400)}`)); }
 			const writes = params.writes.slice(0, 8);
 			const results: Array<{path:string; bytes:number; skipped?:boolean; reason?:string}> = [];
 			await Promise.all(writes.map(async (w, idx) => {
-				const target = resolve(ctx.cwd, w.path);
+				const target = resolveInsideCwd(ctx.cwd, w.path);
 				onUpdate?.({ message: `smart_write ${idx+1}/${writes.length}: ${w.path}` } as any);
 				return withFileMutationQueue(target, async () => {
 					let existing: string | null = null;
@@ -943,7 +955,7 @@ ${m.oldText.slice(0,400)}`)); }
 				const uniqFiles = [...new Set(hitsOut.map(h=>h.file))].slice(0, 3);
 				onUpdate?.({ message: `smart_grep reading ${uniqFiles.length} file(s)` } as any);
 				reads = await Promise.all(uniqFiles.map(async (f) => {
-					const abs = resolve(ctx.cwd, f);
+					const abs = resolveInsideCwd(ctx.cwd, f);
 					try {
 						let content: string;
 						let mtimeMs = 0, sz = 0;
@@ -996,6 +1008,14 @@ ${m.oldText.slice(0,400)}`)); }
 			if (patch.length > 500_000) throw new Error(failBlock("smart_patch", "patch too large (>500KB)", "Split into smaller patches <=500KB or use smart_edit/smart_bundle for large changes."));
 			const fileCount = (patch.match(/^\+\+\+ b\//gm)||[]).length;
 			const hunkCount = (patch.match(/^@@/gm)||[]).length;
+			// path traversal guard for patch targets
+			for (const pm of patch.matchAll(/^\+\+\+ b\/(.+)$/gm)) {
+				const pp = (pm[1] as string).trim();
+				if (pp.includes("..") || pp.startsWith("/") || pp.startsWith("\\")) {
+					throw new Error(failBlock("smart_patch", `Path traversal blocked in patch: "${pp}"`, `Use relative paths inside workspace, no ".." or absolute.`));
+				}
+				try { resolveInsideCwd(ctx.cwd, pp); } catch (e:any) { throw new Error(failBlock("smart_patch", String(e.message).slice(0,400), `Use a safe relative path inside cwd.`)); }
+			}
 			const tmp = join(tmpdir(), `smart-patch-${randomUUID()}.patch`);
 			await writeFile(tmp, patch, "utf8");
 			try {
@@ -1009,7 +1029,7 @@ ${m.oldText.slice(0,400)}`)); }
 						const fallbackResults: string[] = [];
 						let fallbackOk = 0;
 						for (const f of parsed.slice(0,8)) {
-							const target = resolve(ctx.cwd, f.path);
+							const target = resolveInsideCwd(ctx.cwd, f.path);
 							try {
 								let cur = "";
 								try { cur = await readFile(target, "utf8"); } catch { cur = ""; }
@@ -1033,7 +1053,7 @@ ${m.oldText.slice(0,400)}`)); }
 				onUpdate?.({ message: "smart_patch: applying" } as any);
 				await execFile("git", ["apply", tmp], { cwd: ctx.cwd, timeout: 15000 } as any);
 				const files = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m=>m[1].trim()).slice(0, 20);
-				for (const f of files) { readCache.delete(f); readCache.delete(resolve(ctx.cwd, f)); }
+				for (const f of files) { readCache.delete(f); try { readCache.delete(resolve(ctx.cwd, f)); } catch {} }
 				grepCache.clear(); state.smartPatches += 1;
 				if (files.length > 1) { state.callsSaved += (files.length - 1); state.tokensSavedEst += estimateTokens(patch.length/4); }
 				scheduleTelemetry(piRef, "smart-tools:smart_patch", { files, at: Date.now(), bytes: patch.length });
@@ -1050,7 +1070,7 @@ ${m.oldText.slice(0,400)}`)); }
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
-			let t = `${theme.fg("success","✓")} ${theme.fg("accent", d?.files?.length ? `${d.files.length} file(s)` : "patch")} ${theme.fg("dim", "applied")}${d?.fallback? theme.fg("warn"," fallback"):""}`;
+			let t = `${theme.fg("success","✓")} ${theme.fg("accent", d?.files?.length ? `${d.files.length} file(s)` : "patch")} ${theme.fg("dim", "applied")}${d?.fallback? theme.fg("warning"," fallback"):""}`;
 			if (d?.bytes) t += theme.fg("dim", ` ${formatSize(d.bytes)}`);
 			if (!opts.expanded) { t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t, 0, 0); }
 			if (d?.files?.length) t += `\n${d.files.slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
@@ -1109,7 +1129,7 @@ ${m.oldText.slice(0,400)}`)); }
 				let editFail: Error | null = null;
 				if (params.dryRun) {
 					for (const ef of params.edits!) {
-						const target = resolve(ctx.cwd, ef.path);
+						const target = resolveInsideCwd(ctx.cwd, ef.path);
 						let cur = ""; try { cur = await readFile(target, "utf8"); } catch { cur = ""; }
 						const v = validateEdits(cur, ef.edits);
 						const wouldApply = v.missing.length===0 && v.overlaps.length===0 && (!params.strict || v.lowConfidence.length===0);
@@ -1118,7 +1138,7 @@ ${m.oldText.slice(0,400)}`)); }
 					}
 				} else {
 					await Promise.all(params.edits!.map(async (ef)=>{
-						const target = resolve(ctx.cwd, ef.path);
+						const target = resolveInsideCwd(ctx.cwd, ef.path);
 						try {
 							await withFileMutationQueue(target, async()=>{
 								let cur = ""; try { cur = await readFile(target, "utf8"); } catch (e:any) { if ((e as NodeJS.ErrnoException).code !== "ENOENT" || ef.createIfMissing === false) throw e; cur = ""; }
@@ -1150,7 +1170,7 @@ ${m.oldText.slice(0,400)}`)); }
 				const writes = params.writes!.slice(0, BUNDLE_MAX);
 				const results: Array<{path:string; bytes:number; skipped?:boolean}> = [];
 				await Promise.all(writes.map(async (w)=>{
-					const target = resolve(ctx.cwd, w.path);
+					const target = resolveInsideCwd(ctx.cwd, w.path);
 					return withFileMutationQueue(target, async()=>{
 						let existing: string|null=null; try { existing = await readFile(target,"utf8"); } catch {}
 						if (existing !== null && hashContent(existing)===hashContent(w.content)) { results.push({path:w.path, bytes:w.content.length, skipped:true}); state.dedupSkipped+=1; return; }
@@ -1387,15 +1407,15 @@ ${m.oldText.slice(0,400)}`)); }
 		}
 		(async()=>{
 			try {
-				const { stdout: diffOut } = await exec("git diff --name-only 2>/dev/null | head -n 8", { cwd: ctx.cwd, timeout: 8000 } as any).catch(()=>({stdout:""} as any));
-				const { stdout: statusOut } = await exec("git status --porcelain 2>/dev/null | head -n 8", { cwd: ctx.cwd, timeout: 8000 } as any).catch(()=>({stdout:""} as any));
+				const { stdout: diffOut } = await execFile("git", ["diff","--name-only"], { cwd: ctx.cwd, timeout: 8000, maxBuffer: 50000 } as any).catch(()=>({stdout:""} as any));
+				const { stdout: statusOut } = await execFile("git", ["status","--porcelain"], { cwd: ctx.cwd, timeout: 8000, maxBuffer: 50000 } as any).catch(()=>({stdout:""} as any));
 				const files = new Set<string>();
 				for (const l of String(diffOut).split("\n").map(s=>s.trim()).filter(Boolean)) files.add(l);
 				for (const l of String(statusOut).split("\n").map(s=>s.trim()).filter(Boolean)) { const m = l.match(/^\s*[?MADRCU]+\s+(.+)$/); if (m) files.add(m[1].trim()); }
 				const top = [...files].filter(f=> !f.includes("node_modules") && !f.includes(".git")).slice(0,4);
 				if (top.length) {
 					await Promise.all(top.map(async (f)=>{
-						const abs = resolve(ctx.cwd, f);
+						const abs = resolveInsideCwd(ctx.cwd, f);
 						try { const st = await stat(abs); const c = await readFile(abs, "utf8"); readCache.set(f, { content: c, mtimeMs: (st as any).mtimeMs || Date.now(), hash: hashContent(c), at: Date.now(), size: c.length }); readCache.set(abs, { content: c, mtimeMs: (st as any).mtimeMs || Date.now(), hash: hashContent(c), at: Date.now(), size: c.length }); } catch {}
 					}));
 					touchCacheEvict();
