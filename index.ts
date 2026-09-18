@@ -451,11 +451,18 @@ export default function smartTools(pi: ExtensionAPI): void {
 				piRef.appendEntry("smart-tools:smart_edit", { path: params.path, edits: params.edits.length, at: Date.now() });
 				syncSmartUI(ctx);
 				const summary = `smart_edit ${params.path}: ${applied.length} edit(s) applied${dedupSkipped?` (${dedupSkipped} dedup skipped)`:""} (${curInside.length} -> ${next.length} bytes)`;
+								const diffLines: string[] = [`--- a/${params.path}`, `+++ b/${params.path}`];
+				for (const a of applied) {
+					diffLines.push(`@@ edit ${a.index} ${a.hit?.strategy ?? "exact"} (${Math.round((a.hit?.confidence??1)*100)}%) @@`);
+					if (a.isAppend) { for (const l of a.newText.split("\n")) diffLines.push(`+${l}`); }
+					else { for (const l of a.oldText.split("\n")) diffLines.push(`-${l}`); for (const l of a.newText.split("\n")) diffLines.push(`+${l}`); }
+				}
+				const diff = diffLines.join("\n");
 				const truncation = truncateHead(summary, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 				const text = truncation.truncated ? `${truncation.content}\n[truncated ${formatSize(truncation.outputBytes)}/${formatSize(truncation.totalBytes)}]` : truncation.content;
 				return {
 					content: [{ type: "text", text }],
-					details: { path: params.path, applied: applied.length, dedupSkipped, bytesBefore: curInside.length, bytesAfter: next.length, strategies: applied.map(a=>({i:a.index, c:a.hit?.confidence, s:a.hit?.strategy})) },
+					details: { path: params.path, applied: applied.length, dedupSkipped, bytesBefore: curInside.length, bytesAfter: next.length, strategies: applied.map(a=>({i:a.index, c:a.hit?.confidence, s:a.hit?.strategy})), diff },
 				};
 			});
 		},
@@ -481,10 +488,28 @@ export default function smartTools(pi: ExtensionAPI): void {
 				text += theme.fg("dim", ` ${d.bytesBefore}→${d.bytesAfter} (${delta>0?"+" : ""}${delta}B)`);
 			}
 			if (d.dedupSkipped) text += theme.fg("dim", ` (+${d.dedupSkipped} dedup)`);
-			if (!opts.expanded) text += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else {
+			if (!opts.expanded) {
+				if (d.diff) {
+					let add=0, rem=0;
+					for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; }
+					text += ` ${theme.fg("success", `+${add}`)}${theme.fg("dim", " / ")}${theme.fg("error", `-${rem}`)}`;
+				}
+				text += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+				return new Text(text, 0, 0);
+			}
+			if (d.diff) {
+				const diffLines = (d.diff as string).split("\n").slice(0, 30);
+				let add=0, rem=0;
+				for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; }
+				text += ` ${theme.fg("success", `+${add}`)}${theme.fg("dim", " / ")}${theme.fg("error", `-${rem}`)}`;
+				for (const line of diffLines) {
+					if (line.startsWith("+") && !line.startsWith("+++")) text += `\n${theme.fg("success", line)}`;
+					else if (line.startsWith("-") && !line.startsWith("---")) text += `\n${theme.fg("error", line)}`;
+					else text += `\n${theme.fg("dim", line)}`;
+				}
+				if ((d.diff as string).split("\n").length > 30) text += `\n${theme.fg("muted", `... ${(d.diff as string).split("\n").length - 30} more diff lines`)}`;
+			} else {
 				if (d.strategies) text += `\n ${theme.fg("muted", d.strategies.map((s:any)=>`#${s.i}:${s.s}(${(s.c*100|0)}%)`).join(" "))}`;
-				text += `\n ${theme.fg("dim", "what happened: " + (d.applied?`${d.applied} hunk(s) applied` : "no-op") + (d.noOp?" — content unchanged":""))}`;
 			}
 			return new Text(text, 0, 0);
 		},
@@ -592,15 +617,18 @@ export default function smartTools(pi: ExtensionAPI): void {
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
-			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)}`;
+			const content = (result.content?.[0] as any)?.text ?? "";
+			const lineCount = content.split("\n").length;
+			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)} ${theme.fg("dim", `${lineCount} lines`)}`;
 			if (d?.cacheHits) t += theme.fg("success", ` ↻${d.cacheHits} cached`);
-			if (d?.perFileBudget) t += theme.fg("dim", ` budget:${formatSize(d.perFileBudget)}/file`);
-			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else {
-				t += `\n${(d?.files ?? []).slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
-				if ((d?.files?.length??0)>8) t += `\n ${theme.fg("dim", `+${d.files.length-8} more`)}`;
-				t += `\n ${theme.fg("dim", "what happened: " + (d?.count??0) + " file(s) read" + (d?.cacheHits?` (${d.cacheHits} from cache)` : ""))}`;
+			if (!opts.expanded) {
+				t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+				return new Text(t, 0, 0);
 			}
+			const lines = content.split("\n").slice(0, 15);
+			for (const line of lines) t += `\n${theme.fg("dim", line.slice(0, 200))}`;
+			if (lineCount > 15) t += `\n${theme.fg("muted", `... ${lineCount - 15} more lines`)}`;
+			t += `\n ${theme.fg("dim", (d?.files ?? []).slice(0,8).join(", "))}`;
 			return new Text(t, 0, 0);
 		},
 	});
@@ -660,15 +688,15 @@ export default function smartTools(pi: ExtensionAPI): void {
 		},
 		renderResult(result, opts, theme) {
 			const d = result.details as any;
-			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)}`;
-			if (d?.written?.length) t += theme.fg("dim", ` ${d.written.length} written`);
+			let t = `${theme.fg("success", "✓")} ${theme.fg("accent", `${d?.count ?? 0} file(s)`)} ${theme.fg("dim", `${d?.written?.length ?? 0} written`)}`;
 			if (d?.skipped?.length) t += theme.fg("dim", ` ${d.skipped.length} skipped`);
-			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand", "expand")})`)}`;
-			else {
-				t += `\n${(d?.writes ?? []).slice(0,8).map((f:string)=>`  ${theme.fg(d?.skipped?.includes(f)?"dim":"muted", (d?.skipped?.includes(f)?"○":"•")+" "+f + (d?.skipped?.includes(f)?" (no-op — hash equal)":""))}`).join("\n")}`;
-				if ((d?.writes?.length??0)>8) t += `\n ${theme.fg("dim", `+${d.writes.length-8} more`)}`;
-				t += `\n ${theme.fg("dim", "what happened: " + (d?.written?.length??0) + " written" + (d?.skipped?.length?`, ${d.skipped.length} skipped (unchanged)`:""))}`;
+			if (!opts.expanded) {
+				t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+				return new Text(t, 0, 0);
 			}
+			t += `\n${theme.fg("success", "Written")}`;
+			t += `\n${(d?.writes ?? []).slice(0,8).map((f:string)=>`  ${theme.fg(d?.skipped?.includes(f)?"dim":"muted", (d?.skipped?.includes(f)?"○":"•")+" "+f + (d?.skipped?.includes(f)?" (no-op — hash equal)":""))}`).join("\n")}`;
+			if ((d?.writes?.length??0)>8) t += `\n ${theme.fg("dim", `+${d.writes.length-8} more`)}`;
 			return new Text(t, 0, 0);
 		},
 	});
@@ -800,15 +828,15 @@ export default function smartTools(pi: ExtensionAPI): void {
 			const d = result.details as any;
 			let t = `${theme.fg("success","✓")} ${theme.fg("accent", `${d?.count ?? 0} hits`)} ${theme.fg("dim", `via ${d?.engine ?? "rg"}`)}`;
 			if (d?.reads) t += theme.fg("dim", ` +${d.reads} reads`);
-			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
-			else {
-				const hits = (d?.hits ?? []).slice(0,4) as Array<any>;
-				if (hits.length) t += `\n${hits.map((h:any)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", `${h.file}:${h.line}`)} ${theme.fg("dim", h.preview.slice(0,60))}`).join("\n")}`;
-				if ((d?.count??0)>4) t += `\n ${theme.fg("dim", `+${d.count-4} more`)}`;
-				t += `\n ${theme.fg("dim", "what happened: " + (d?.count??0) + " hit(s)" + (d?.reads?` +${d.reads} file(s) read`:""))}`;
+			if (!opts.expanded) {
+				t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+				return new Text(t, 0, 0);
 			}
+			const hits = (d?.hits ?? []).slice(0,8) as Array<any>;
+			if (hits.length) t += `\n${hits.map((h:any)=>`  ${theme.fg("dim","•")} ${theme.fg("accent", `${h.file}:${h.line}`)} ${theme.fg("dim", h.preview.slice(0,80))}`).join("\n")}`;
+			if ((d?.count??0)>8) t += `\n ${theme.fg("muted", `... ${d.count-8} more hits`)}`;
 			return new Text(t, 0, 0);
-		}
+		},
 	});
 
 	// ---- smart_patch — git apply bridge (deferred lazy)
@@ -860,13 +888,14 @@ export default function smartTools(pi: ExtensionAPI): void {
 			const d = result.details as any;
 			let t = `${theme.fg("success","✓")} ${theme.fg("accent", d?.files?.length ? `${d.files.length} file(s)` : "patch")} ${theme.fg("dim", "applied")}`;
 			if (d?.bytes) t += theme.fg("dim", ` ${formatSize(d.bytes)}`);
-			if (!opts.expanded) t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
-			else {
-				if (d?.files?.length) t += `\n${d.files.slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
-				t += `\n ${theme.fg("dim", "what happened: patch applied atomically" + (d?.files?.length?` to ${d.files.length} file(s)`:""))}`;
+			if (!opts.expanded) {
+				t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`;
+				return new Text(t, 0, 0);
 			}
+			if (d?.files?.length) t += `\n${d.files.slice(0,8).map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
+			t += `\n${theme.fg("success", "applied")}`;
 			return new Text(t, 0, 0);
-		}
+		},
 	});
 
 	// ---- search_smart_tools — deferred loader (generic)
