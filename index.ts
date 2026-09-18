@@ -739,8 +739,31 @@ export default function smartTools(pi: ExtensionAPI): void {
 			if (d.bytesBefore != null && d.bytesAfter != null) { const delta = d.bytesAfter - d.bytesBefore; text += theme.fg("dim", ` ${d.bytesBefore}→${d.bytesAfter} (${delta>0?"+" : ""}${delta}B)`); }
 			if (d.dedupSkipped) text += theme.fg("dim", ` (+${d.dedupSkipped} dedup)`);
 			if (d.lowConfidence) text += theme.fg("warn", ` ⚠${d.lowConfidence} lowConf`);
-			if (!opts.expanded) { if (d.diff) { let add=0, rem=0; for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; } text += ` ${theme.fg("success", `+${add}`)}${theme.fg("dim", " / ")}${theme.fg("error", `-${rem}`)}`; } text += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`; return new Text(text, 0, 0); }
-			if (d.diff) { const diffLines = (d.diff as string).split("\n").slice(0, 30); let add=0, rem=0; for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; } text += ` ${theme.fg("success", `+${add}`)}${theme.fg("dim", " / ")}${theme.fg("error", `-${rem}`)}`; for (const line of diffLines) { if (line.startsWith("+") && !line.startsWith("+++")) text += `\n${theme.fg("success", line)}`; else if (line.startsWith("-") && !line.startsWith("---")) text += `\n${theme.fg("error", line)}`; else text += `\n${theme.fg("dim", line)}`; } if ((d.diff as string).split("\n").length > 30) text += `\n${theme.fg("muted", `... ${(d.diff as string).split("\n").length - 30} more diff lines`)}`; if (d.suggestion?.length) text += `\n${theme.fg("warn", "hint: low confidence — next time copy suggested block:")}\n${theme.fg("dim", JSON.stringify(d.suggestion).slice(0,400))}`; } else { if (d.strategies) text += `\n ${theme.fg("muted", d.strategies.map((s:any)=>`#${s.i}:${s.s}(${(s.c*100|0)}%)`).join(" "))}`; } return new Text(text, 0, 0); }
+			if (!opts.expanded) {
+				if (d.diff) {
+					let add = 0, rem = 0;
+					for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; }
+					text += " " + theme.fg("success", "+" + add) + theme.fg("dim", " / ") + theme.fg("error", "-" + rem);
+				}
+				text += " " + theme.fg("dim", "(" + keyHint("app.tools.expand","expand") + ")");
+				return new Text(text, 0, 0);
+			}
+			if (d.diff) {
+				const diffLines = (d.diff as string).split("\n").slice(0, 30);
+				let add = 0, rem = 0;
+				for (const l of (d.diff as string).split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) add++; if (l.startsWith("-") && !l.startsWith("---")) rem++; }
+				text += " " + theme.fg("success", "+" + add) + theme.fg("dim", " / ") + theme.fg("error", "-" + rem);
+				for (const line of diffLines) {
+					if (line.startsWith("+") && !line.startsWith("+++")) text += "\n" + theme.fg("success", line);
+					else if (line.startsWith("-") && !line.startsWith("---")) text += "\n" + theme.fg("error", line);
+					else text += "\n" + theme.fg("dim", line);
+				}
+				if ((d.diff as string).split("\n").length > 30) text += "\n" + theme.fg("muted", "... " + ((d.diff as string).split("\n").length - 30) + " more diff lines");
+				if (d.suggestion?.length) text += "\n" + theme.fg("warn", "hint: low confidence - next time copy suggested block:") + "\n" + theme.fg("dim", JSON.stringify(d.suggestion).slice(0,400));
+			} else {
+				if (d.strategies) text += "\n " + theme.fg("muted", (d.strategies as any[]).map((s:any)=>"#" + s.i + ":" + s.s + "(" + ((s.c*100)|0) + "%)").join(" "));
+			}
+			return new Text(text, 0, 0);
 	},
 	});
 	// ---- smart_read (batched, slice-aware, adaptive budget, binary guard, cache)
