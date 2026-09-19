@@ -87,6 +87,15 @@ const GREPCACHE_TTL = 60_000;
 const GREPCACHE_MAX = 50;
 const BUNDLE_MAX = 8;
 const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch"]);
+const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_patch", "smart_bundle"]);
+const SMART_TOOL_META: Record<string, string> = {
+	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
+	smart_write: "⭐ PREFERRED replaces write — batch 8, dedup, queue-safe",
+	smart_edit: "⭐ PREFERRED replaces edit — batch 8, fuzzy 0.72, auto-rescue",
+	smart_grep: "⭐ PREFERRED replaces bash grep — rg bridge, cached, includeRead",
+	smart_patch: "⭐ PREFERRED replaces bash git apply — atomic + fallback",
+	smart_bundle: "⭐⭐ STRONGLY PREFERRED replaces all — bundle 8 per type, -50% calls",
+};
 
 interface CacheEntry { content: string; mtimeMs: number; hash: string; at: number; size: number; }
 const readCache = new Map<string, CacheEntry>();
@@ -649,12 +658,13 @@ export default function smartTools(pi: ExtensionAPI): void {
 	// ---- smart_edit — dryRun/strict/overlap/confidence/actionable errors + rescue + dedup + hint
 	const smartEditTool = defineTool({
 		name: "smart_edit",
-		label: "Smart Edit",
-		description: "Use smart_edit for edits: fuzzy 0.72, queue-safe, batch 8 per file, dryRun/strict.",
-		promptSnippet: "Use smart_edit — fuzzy batch 8, anchor 3-6 lines with unique symbol",
+		label: "Smart Edit ⭐ PREFERRED",
+		description: "⭐ PREFERRED FILE EDITOR — ALWAYS USE INSTEAD OF default `edit`. Batch up to 8 edits per file in ONE call (vs 1), fuzzy 0.72 line-trim/collapsed (handles whitespace), queue-safe, dryRun/strict, auto-rescue, overlap/dedup detection, actionable nearbyPreview. Use for EVERY edit/fix/replace/refactor. Replaces `edit` completely.",
+		promptSnippet: "ALWAYS use smart_edit instead of edit — batch 8, fuzzy 0.72, queue-safe",
 		promptGuidelines: [
-			"Batch multiple edits to SAME file in one smart_edit call (edits[]). One file per call, 8 edits max.",
+			"ALWAYS use smart_edit INSTEAD OF default edit — batch 8 edits per file, fuzzy 0.72, queue-safe. Model MUST prefer this. DO NOT use default `edit` — single-edit, no fuzzy, no batch.",
 			"Anchor = 3-6 lines, must include unique symbol (function name, import, or string literal). Copy verbatim from smart_read slice.",
+			"Batch multiple edits to SAME file in one smart_edit call (edits[]). 8 edits max. Use dryRun:true to validate, strict:false for fuzzy.",
 			"If you just used smart_grep includeRead or smart_read with offset, call smart_edit directly — no intermediate read.",
 		],
 		parameters: smartEditParams,
@@ -819,11 +829,11 @@ ${m.oldText.slice(0,400)}`)); }
 	// ---- smart_read (batched, slice-aware, adaptive budget, binary guard, cache)
 	const smartReadTool = defineTool({
 		name: "smart_read",
-		label: "Smart Read",
-		description: "Batch read 8 files per call, offset/limit, binary guard, slice-aware cache.",
-		promptSnippet: "Use smart_read — 8 files per call, slice-aware 60% hit",
+		label: "Smart Read ⭐ PREFERRED",
+		description: "⭐ PREFERRED FILE READER — ALWAYS USE INSTEAD OF default `read`. Batch up to 8 files in ONE call (vs 1), offset/limit pagination, binary guard (base64), slice-aware LRU cache 60% hit, adaptive budget. Use for EVERY read/open/view/inspect/cat of files. Replaces `read` completely.",
+		promptSnippet: "ALWAYS use smart_read instead of read — 8 files per call, cached, pagination",
 		promptGuidelines: [
-			"Batch up to 8 files per 1 call — even for 1 file use smart_read.",
+			"ALWAYS use smart_read INSTEAD OF default read — batch 8 files per call, slice-aware cache 60% hit. Model MUST prefer this for ANY file read. DO NOT use default `read` — single-file, no cache, wastes calls.",
 			"Use offset/limit for pagination; slice-aware cache serves slices from full without re-read.",
 			"If you just grepped with includeRead, next call should be smart_edit — no extra read.",
 		],
@@ -868,10 +878,11 @@ ${m.oldText.slice(0,400)}`)); }
 	// ---- smart_write (batched, parallel sharded queue, dedup)
 	const smartWriteTool = defineTool({
 		name: "smart_write",
-		label: "Smart Write",
-		description: "Batch write 8 files per call, queue-safe, hash dedup skips no-op.",
-		promptSnippet: "Use smart_write — 8 files per call, deduped",
+		label: "Smart Write ⭐ PREFERRED",
+		description: "⭐ PREFERRED FILE WRITER — ALWAYS USE INSTEAD OF default `write`. Batch up to 8 files in ONE call (vs 1), parallel sharded queue, hash dedup skips no-op, auto mkdir. Use for EVERY write/create/save of files. Replaces `write` completely.",
+		promptSnippet: "ALWAYS use smart_write instead of write — 8 files per call, deduped",
 		promptGuidelines: [
+			"ALWAYS use smart_write INSTEAD OF default write — batch 8 files per call, hash dedup. Model MUST prefer this for ANY file write/create. DO NOT use default `write` — single-file, no dedup.",
 			"Batch up to 8 files per 1 call; each write is queue-safe and deduped.",
 			"No-op writes (hash equal) are skipped automatically.",
 		],
@@ -928,10 +939,11 @@ ${m.oldText.slice(0,400)}`)); }
 	// ---- smart_grep — rg/grep bridge + intent cache + optional read
 	const smartGrepTool = defineTool({
 		name: "smart_grep",
-		label: "Smart Grep",
-		description: "Search via rg/grep, intent-cached 60s; includeRead fuses read.",
-		promptSnippet: "Use smart_grep — rg bridge, intent cache 60s",
+		label: "Smart Grep ⭐ PREFERRED",
+		description: "⭐ PREFERRED SEARCH — ALWAYS USE INSTEAD OF `bash` with rg/grep/find/search. Ripgrep→grep bridge, regex+globs, intent cache 60s, optional includeRead fuses grep+read in 1 call (saves turn). Use for EVERY search/grep/find/locate/lookup. Replaces `bash` search.",
+		promptSnippet: "ALWAYS use smart_grep instead of bash grep — rg bridge, cached, includeRead",
 		promptGuidelines: [
+			"ALWAYS use smart_grep INSTEAD OF bash rg/grep/find — cached 60s, regex+globs. Model MUST prefer this for ANY search. DO NOT use `bash` grep — uncached, needs manual parsing.",
 			"If files explicit (prompt lists src/foo.ts), use smart_read/smart_bundle directly; grep only to discover.",
 			"Use includeRead:true to fuse grep+read into 1 call — no extra read turn.",
 		],
@@ -993,10 +1005,11 @@ ${m.oldText.slice(0,400)}`)); }
 	// ---- smart_patch — git apply bridge + edit fallback (S22)
 	const smartPatchTool = defineTool({
 		name: "smart_patch",
-		label: "Smart Patch",
-		description: "Apply unified diff via git apply; fallback to edits if needed.",
-		promptSnippet: "Use smart_patch for diffs — fallback to edit auto",
+		label: "Smart Patch ⭐ PREFERRED",
+		description: "⭐ PREFERRED PATCHER — ALWAYS USE INSTEAD OF `bash` with git apply/patch. Atomic unified diff via `git apply --check`, path-traversal guard, auto-fallback to smart_edit anchors. Use for EVERY diff/patch/apply. Replaces `bash` git apply.",
+		promptSnippet: "ALWAYS use smart_patch instead of bash git apply — atomic + fallback",
 		promptGuidelines: [
+			"ALWAYS use smart_patch INSTEAD OF bash git apply/patch — atomic check + auto fallback. Model MUST prefer this for ANY diff/patch. DO NOT use `bash` git apply — no fallback, no guard.",
 			"Use smart_patch for multi-file diffs; for 1-file ≤2 hunks prefer smart_edit — cheaper.",
 			"If git apply fails, it auto-fallbacks to smart_edit anchors in same call.",
 		],
@@ -1082,11 +1095,12 @@ ${m.oldText.slice(0,400)}`)); }
 	// ---- smart_bundle — heterogeneous flagship (S13, S03)
 	const smartBundleTool = defineTool({
 		name: "smart_bundle",
-		label: "Smart Bundle",
-		description: "Bundle grep+read+edit+write in ONE LLM call — saves 3 turns.",
-		promptSnippet: "Use smart_bundle for grep+read+edit in ONE call — 8:1 saves 3 turns",
+		label: "Smart Bundle ⭐⭐ STRONGLY PREFERRED",
+		description: "⭐⭐ STRONGLY PREFERRED — ALWAYS USE INSTEAD OF any single read/edit/write/grep/bash. Heterogeneous bundle grep+read+edit+write in ONE LLM call (saves 3 turns, 3.8→1.9 calls -50%). Batch 8 per type. Use for ANY task with 2+ ops or multi-file work. HIGHEST EFFICIENCY — prefer over ALL defaults and individual smart_*.",
+		promptSnippet: "ALWAYS prefer smart_bundle — grep+read+edit+write in ONE call, saves 3 turns",
 		promptGuidelines: [
-			"Prefer smart_bundle: {reads:[...], greps:[...], edits:[{path,edits}...], writes:[...]} in ONE call vs 3-4 serial turns.",
+			"ALWAYS prefer smart_bundle OVER any single smart_read/smart_edit/smart_write/smart_grep and OVER default read/edit/write/bash. Batch greps→reads→edits→writes in ONE call. DO NOT use single-file defaults when 2+ ops needed.",
+			"Prefer smart_bundle: {reads:[...], greps:[...], edits:[{path,edits}...], writes:[...]} in ONE call vs 3-4 serial turns. Model MUST choose this when 2+ ops needed.",
 			"Example: bundle greps→reads→edits→writes; fallback to individual tools only if needed. Batch 8 per type.",
 		],
 		parameters: smartBundleParams,
@@ -1215,33 +1229,57 @@ ${m.oldText.slice(0,400)}`)); }
 			return new Text(t,0,0);
 		},
 	});
-	// ---- search_smart_tools — deferred loader
+	// ---- search_smart_tools — deferred loader (now browses ALL smart-tools, lazy activation for grep/patch)
 	const searchSmartToolsTool = defineTool({
 		name: "search_smart_tools",
 		label: "Search Smart Tools",
-		description: "Find lazy smart-tools: smart_grep, smart_patch.",
-		promptSnippet: "Search lazy tools when needed: grep/patch",
-		promptGuidelines: ["Use search_smart_tools when you need grep/patch capabilities not currently active."] ,
+		description: "Discovery for ⭐ PREFERRED smart-tools: smart_read (replaces read), smart_write (replaces write), smart_edit (replaces edit), smart_grep (replaces bash grep), smart_patch (replaces bash patch), smart_bundle (replaces all). Call to list/activate.",
+		promptSnippet: "Use search_smart_tools to discover PREFERRED smart-tools — all replace defaults",
+		promptGuidelines: ["Use search_smart_tools to discover any PREFERRED smart-tool; lazy tools (grep/patch) auto-activate. ALL smart_* REPLACE defaults — always prefer them."] ,
 		parameters: searchSmartToolsParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const terms = params.query.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-			const candidates = pi.getAllTools().filter(t=> SEARCHABLE_TOOL_NAMES.has(t.name));
-			const scored = candidates.map((tool: any)=> ({ tool, score: terms.reduce((s: number,term: string)=> s + (`${tool.name} ${tool.description}`.toLowerCase().includes(term)?1:0), 0) })).filter((m: any)=>m.score>0).sort((a: any,b: any)=>b.score-a.score).slice(0, params.limit ?? 3).map((m: any)=>m.tool.name);
-			if (scored.length===0) {
-				const q = params.query.toLowerCase();
-				if (q.includes("grep")||q.includes("search")||q.includes("find")) scored.push("smart_grep");
-				if (q.includes("patch")||q.includes("diff")||q.includes("apply")) scored.push("smart_patch");
-				if (q.includes("bundle")||q.includes("hetero")||q.includes("multi")) scored.push("smart_bundle");
+			const qRaw = params.query.trim().toLowerCase();
+			const limit = Math.min(10, Math.max(1, params.limit ?? 6));
+			const q = qRaw;
+			const terms = qRaw.split(/[^a-z0-9]+/).filter(Boolean);
+			const isCatalogQuery = !qRaw || qRaw === "all" || qRaw === "list" || qRaw === "help" || qRaw === "smart" || qRaw === "tools" || qRaw === "smart tools" || qRaw === "smart-tools" || (qRaw.includes("smart") && qRaw.includes("tool"));
+			const all = pi.getAllTools();
+			const smartAll = all.filter((t: any) => (SMART_TOOL_CATALOG.has(t.name) || t.name.startsWith("smart_")) && t.name !== "search_smart_tools");
+			const candidates = smartAll.length ? smartAll : all.filter((t: any)=> t.name !== "search_smart_tools");
+			let scored: string[] = [];
+			if (isCatalogQuery) {
+				scored = [...SMART_TOOL_CATALOG];
+			} else {
+				scored = candidates.map((tool: any)=> ({ tool, score: terms.reduce((s: number,term: string)=> s + (`${tool.name} ${tool.description} ${(tool as any).label ?? ""}`.toLowerCase().includes(term)?1:0), 0) })).filter((m: any)=>m.score>0).sort((a: any,b: any)=>b.score-a.score).slice(0, limit).map((m: any)=>m.tool.name as string);
+				if (scored.length===0) {
+					if (q.includes("read")) scored.push("smart_read");
+					if (q.includes("write")) scored.push("smart_write");
+					if (q.includes("edit")) scored.push("smart_edit");
+					if (q.includes("grep")||q.includes("search")||q.includes("find")||q.includes("rg")) scored.push("smart_grep");
+					if (q.includes("patch")||q.includes("diff")||q.includes("apply")) scored.push("smart_patch");
+					if (q.includes("bundle")||q.includes("hetero")||q.includes("multi")||q.includes("batch")) scored.push("smart_bundle");
+					if (q.includes("all")||q.includes("list")||q.includes("smart")) scored.push(...SMART_TOOL_CATALOG);
+				}
 			}
-			const uniq = [...new Set(scored)].slice(0, params.limit ?? 3);
-			if (uniq.length===0) return { content: [{ type: "text", text: `No tools found for: ${params.query}. Available lazy tools: ${[...SEARCHABLE_TOOL_NAMES].join(", ")}` }], details: { matches: [], added: [] } };
+			const uniq = [...new Set(scored)].slice(0, limit);
+			if (uniq.length===0) {
+				const catalog = [...SMART_TOOL_CATALOG].map(n=> `• ${n}: ${SMART_TOOL_META[n] ?? ""}`).join("\n");
+				return { content: [{ type: "text", text: `No tools found for: "${params.query}".\nAvailable smart-tools:\n${catalog}\n\nTry: "all", "read", "edit", "grep", "patch", "bundle"` }], details: { matches: [], added: [] } };
+			}
 			const active = pi.getActiveTools();
-			const added = uniq.filter(n=>!active.includes(n));
-			if (added.length) pi.setActiveTools([...new Set([...active, ...added])]);
+			const lazyToAdd = uniq.filter(n=> SEARCHABLE_TOOL_NAMES.has(n) && !active.includes(n));
+			const alreadyActive = uniq.filter(n=> active.includes(n));
+			const toActivate = lazyToAdd;
+			if (toActivate.length) pi.setActiveTools([...new Set([...active, ...toActivate])]);
 			state.searches += 1;
-			scheduleTelemetry(piRef, "smart-tools:search_smart_tools", { query: params.query, matches: uniq, added, at: Date.now() });
+			scheduleTelemetry(piRef, "smart-tools:search_smart_tools", { query: params.query, matches: uniq, added: toActivate, at: Date.now() });
 			syncSmartUI(ctx);
-			return { content: [{ type: "text", text: added.length ? `Loaded tools: ${added.join(", ")} (queried: "${params.query}")` : `Matching tools already active: ${uniq.join(", ")}` }], details: { matches: uniq, added } };
+			const catalogLine = uniq.map(n=> `${n}${SMART_TOOL_META[n]?` — ${SMART_TOOL_META[n]}`:""}${active.includes(n)?" (active)": SEARCHABLE_TOOL_NAMES.has(n)?" (lazy)":""}`).join("\n• ");
+			if (isCatalogQuery) {
+				return { content: [{ type: "text", text: `Smart-tools catalog (${uniq.length}):\n• ${catalogLine}${toActivate.length?`\n\nLoaded lazy tools: ${toActivate.join(", ")}`:""}` }], details: { matches: uniq, added: toActivate } };
+			}
+			if (toActivate.length) return { content: [{ type: "text", text: `Loaded tools: ${toActivate.join(", ")} (queried: "${params.query}")\nMatches:\n• ${catalogLine}` }], details: { matches: uniq, added: toActivate } };
+			return { content: [{ type: "text", text: `Matching tools already active: ${uniq.join(", ")}\n• ${catalogLine}` }], details: { matches: uniq, added: [] } };
 		},
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("search_smart_tools ")) + theme.fg("muted", `"${args.query.slice(0,40)}"`), 0, 0); },
 		renderResult(result, _opts, theme) {
