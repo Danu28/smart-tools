@@ -215,6 +215,15 @@ function brainScoreEpisode(e: BrainEpisode, queryTokens: string[], tagFilter?: s
  if(tagFilter && tagFilter.length){ const hasAll=tagFilter.every(t=> e.tags.includes(t)); if(!hasAll) score=0; else score*=1.2; }
  const ageDays=(Date.now()-e.at)/86400000; const decay=Math.pow(BRAIN_HALF_LIFE_FACTOR, ageDays/BRAIN_HALF_LIFE_DAYS); return score*decay; }
 function brainParseDepends(text: string): number[] { const m=text.match(/depends:([0-9,\s]+)/); if(!m) return []; return m[1].split(',').map(s=> parseInt(s.trim(),10)).filter(n=> !isNaN(n)); }
+function brainFindPlan(id: string): BrainPlan | undefined {
+  let p = brainPlans.get(id);
+  if (p) return p;
+  if (!id.startsWith("plan:")) { p = brainPlans.get("plan:" + id); if (p) return p; }
+  if (id.startsWith("plan:")) { p = brainPlans.get(id.slice(5)); if (p) return p; }
+  const suffix = id.includes(":") ? id.slice(id.lastIndexOf(":")+1) : id;
+  if (suffix.length >= 2) { for (const [k,v] of brainPlans.entries()) { if (k.endsWith(":" + suffix)) return v; } }
+  return undefined;
+}
 function brainValidatePlanTasks(tasks: string[]): { ok:boolean; err?: string } { if(tasks.length<3) return {ok:false, err:"plan requires 3-10 tasks (got "+tasks.length+")"}; if(tasks.length>10) return {ok:false, err:"plan >10 tasks — chunk: create first 10 then append"}; for(let i=0;i<tasks.length;i++){ const t=tasks[i]; if(t.length<10) return {ok:false, err:"task "+i+" too short (≥10 chars)"}; const deps=brainParseDepends(t); for(const d of deps){ if(d>=i) return {ok:false, err:"task "+i+" depends:"+d+" must be < "+i+" (no self/cycle)"}; if(d<0) return {ok:false, err:"task "+i+" depends negative"}; } } return {ok:true}; }
 
 const _hashMemo = new Map<string,string>();
@@ -1202,6 +1211,7 @@ ${m.oldText.slice(0,400)}`)); }
 		],
 		parameters: smartReadParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			if(!params.files || !Array.isArray(params.files) || params.files.length===0) throw new Error(failBlock("smart_read","files required (1-12)", "Provide files:['path'] or [{path, offset, limit}] — 12 per call max"));
 			const entries = params.files.slice(0, 8).map((f: any) => typeof f === "string" ? { path: f, offset: undefined as number|undefined, limit: undefined as number|undefined, encoding: "utf8" as const } : { path: (f as any).path, offset: (f as any).offset, limit: (f as any).limit, encoding: ((f as any).encoding ?? "utf8") as "utf8"|"base64" });
 			const { texts: reads, cacheHits: cacheHitsThisCall, perFileBudget } = await doSmartReadFiles(entries, ctx.cwd, onUpdate as any);
 			state.smartReads += entries.length;
@@ -1252,6 +1262,7 @@ ${m.oldText.slice(0,400)}`)); }
 		],
 		parameters: smartWriteParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			if(!params.writes || !Array.isArray(params.writes) || params.writes.length===0) throw new Error(failBlock("smart_write","writes required (1-8)", "Provide writes:[{path:'file', content:'...'}] — path relative to cwd, 8 per call max. Example: smart_write {writes:[{path:'a.txt', content:'hello'}]}"));
 			const writes = params.writes.slice(0, 8);
 			const results: Array<{path:string; bytes:number; skipped?:boolean; reason?:string}> = [];
 			await Promise.all(writes.map(async (w: any, idx: number) => {
@@ -2142,18 +2153,22 @@ const smartPatchTool = defineTool({
 		promptSnippet: "Plan after think — smart_plan blocks batch exec until DAG ready", parameters: smartPlanParams,
 		async execute(_id, params, _s, _u, ctx){
 			if(params.id && params.done){
-				const plan=brainPlans.get(params.id); if(!plan) throw new Error(failBlock("smart_plan","plan not found "+params.id, "Create plan first with {goal, tasks:[...]}")); for(const idx of params.done){ if(idx<0||idx>=plan.tasks.length) throw new Error(failBlock("smart_plan","done index out of range "+idx, "Use 0-based indices < "+plan.tasks.length)); plan.tasks[idx].done=true; } if(plan.tasks.every(t=>t.done)) plan.doneAt=Date.now(); syncSmartUI(ctx); return {content:[{type:"text", text:`smart_plan ${plan.id} — ${plan.tasks.filter(t=>t.done).length}/${plan.tasks.length} done`}], details:{ id: plan.id, plan }};
+				let plan = brainFindPlan(params.id);
+				if(!plan) throw new Error(failBlock("smart_plan","plan not found "+params.id, "Create plan first with {goal, tasks:[...]}. Hint: use full id with prefix e.g. \"plan:123:xxxx\" — last plan is \""+([...brainPlans.keys()].slice(-1)[0]||"plan:...")+"\""));
+				for(const idx of params.done){ if(idx<0||idx>=plan.tasks.length) throw new Error(failBlock("smart_plan","done index out of range "+idx, "Use 0-based indices < "+plan.tasks.length)); plan.tasks[idx].done=true; } if(plan.tasks.every(t=>t.done)) plan.doneAt=Date.now(); syncSmartUI(ctx); return {content:[{type:"text", text:`smart_plan ${plan.id} — ${plan.tasks.filter(t=>t.done).length}/${plan.tasks.length} done${plan.tasks.every(t=>t.done)?" — all done → use smart_remember then commit":""}`}], details:{ id: plan.id, plan }};
 			}
 			if(!params.goal) throw new Error(failBlock("smart_plan","goal required", "Provide goal and tasks[3-10] after smart_think"));
 			if(!brainHasThink) throw new Error(failBlock("smart_plan","think required first", "Call smart_think{goal,hypotheses} before smart_plan (strict gate)"));
 			const tasks=params.tasks||[]; const v=brainValidatePlanTasks(tasks); if(!v.ok) throw new Error(failBlock("smart_plan",v.err!, "Tasks 3-10, each ≥10 chars, depends must be < index"));
 			const id=`plan:${Date.now()}:${Math.random().toString(36).slice(2,6)}`;
 			const planTasks: BrainPlanTask[]=tasks.map(t=> ({ text:t, done:false, depends: brainParseDepends(t), check: (t.match(/check:([^ ]+)/)?.[1]) }));
-			const plan: BrainPlan={ id, goal: params.goal, tasks: planTasks, at: Date.now() };
+			if(params.done && Array.isArray(params.done)){ for(const idx of params.done){ if(idx>=0 && idx<planTasks.length) planTasks[idx].done=true; } }
+			const plan: BrainPlan={ id, goal: params.goal, tasks: planTasks, at: Date.now(), doneAt: planTasks.every(t=>t.done) ? Date.now() : undefined };
 			brainPlans.set(id, plan); brainHasPlan=true; brainCurrentPlanId=id;
+			const doneCount = planTasks.filter(t=>t.done).length;
 			try{ pi.appendEntry("smart-tools:smart_plan" as any, { id, goal: params.goal, tasks: tasks.length } as any);}catch{}
 			syncSmartUI(ctx);
-			return { content:[{type:"text", text:`smart_plan ${id} — ${tasks.length} tasks\n`+tasks.map((t,i)=> `[ ] ${i}: ${t}`).join("\n")}], details:{ id, plan }};
+			return { content:[{type:"text", text:`smart_plan ${id} — ${tasks.length} tasks\n`+planTasks.map((t,i)=> `${t.done?"[x]":"[ ]"} ${i}: ${t.text}`).join("\n")}], details:{ id, plan }};
 		}, renderCall(a,t){ return new Text(t.fg("toolTitle",t.bold("smart_plan "))+t.fg("muted",(a.goal||a.id||"").slice(0,40)),0,0); }, renderResult(r,o,t){ const d=(r.details as any); return new Text(`${t.fg("success","✓")} ${t.fg("accent",d?.id||"plan")} ${t.fg("dim",`${d?.plan?.tasks?.length||0} tasks`)}`,0,0); }
 	});
 	const smartRecallTool = defineTool({
