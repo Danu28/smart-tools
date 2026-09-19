@@ -1,5 +1,5 @@
 /**
- * smart-tools v3.2 — batching + fuzzy edits + productivity suite
+ * smart-tools v4.0 — batching + fuzzy edits + productivity suite
  *
  * Gaps solved:
  *  1. edit/read/write N:1 batching + whitespace -> smart_edit/smart_read/smart_write (8 per 1 LLM call, fuzzy, queue-safe)
@@ -13,7 +13,8 @@
  *  9. invisible cost           -> LRU read cache (32/5min slice-aware) + grep intent cache + single telemetry flush + prefetch
  *  10. cryptic UX              -> rich status widget + /smart-status + /smart-history + streaming
  *
- * v3.2: + smart_diff (git diff/status/log cache 10s) + smart_scan (ls/stat/tree batch 8) + bundle diffs/scans
+ * v4.0: + smart_exec/symbol/check + bundle execs/symbols/checks + generic TTLCache + health cmd (QDS audit)
+ * v3.2: + smart_diff (git diff/status/log cache 10s→30s) + smart_scan (ls/stat/tree batch 8) + bundle diffs/scans
  * v3.1: + smart_glob (glob 8:1 + intent cache + includeRead) + smart_undo (atomic revert) + smart_edit replaceAll
  * v3.0: smart_bundle heterogeneous 1-call (grep+read+edit+write), slice-aware cache, auto-merge, rescue, adaptive budget
  * Goal: 3.8 → 1.9 calls/task (-50%) without quality drop.
@@ -115,7 +116,7 @@ const GREPCACHE_TTL = 60_000;
 const GREPCACHE_MAX = 50;
 const GLOBCACHE_TTL = 60_000;
 const GLOBCACHE_MAX = 50;
-const DIFFCACHE_TTL = 10_000;
+const DIFFCACHE_TTL = 30_000;
 const DIFFCACHE_MAX = 20;
 const SCANCACHE_TTL = 30_000;
 const SCANCACHE_MAX = 50;
@@ -126,16 +127,16 @@ const SYMBOLCACHE_MAX = 50;
 const CHECKCACHE_TTL = 30_000;
 const CHECKCACHE_MAX = 20;
 const UNDO_MAX = 32;
-const BUNDLE_MAX = 8;
-const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch", "smart_glob", "smart_diff", "smart_scan", "smart_exec", "smart_symbol", "smart_check"]);
+const BUNDLE_MAX = 12;
 const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_diff", "smart_scan", "smart_exec", "smart_symbol", "smart_check", "smart_patch", "smart_bundle", "smart_undo"]);
+const SEARCHABLE_TOOL_NAMES = new Set([...SMART_TOOL_CATALOG].filter(n => !["smart_read", "smart_write", "smart_edit", "smart_bundle", "smart_undo"].includes(n)));
 const SMART_TOOL_META: Record<string, string> = {
 	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
 	smart_write: "⭐ PREFERRED replaces write — batch 8, dedup, queue-safe",
 	smart_edit: "⭐ PREFERRED replaces edit — batch 8, fuzzy 0.72, auto-rescue",
 	smart_grep: "⭐ PREFERRED replaces bash grep — rg bridge, cached, includeRead",
 	smart_glob: "⭐ PREFERRED replaces glob — batch 8 patterns, mtime-sorted, cached, includeRead",
-	smart_diff: "⭐ PREFERRED replaces bash git diff/status/log — cached 10s, staged/stat/base",
+	smart_diff: "⭐ PREFERRED replaces bash git diff/status/log — cached 30s, staged/stat/base",
 	smart_scan: "⭐ PREFERRED replaces bash ls/tree/stat — batch 8 dirs, depth, stat, mtime-sorted",
 	smart_exec: "⭐ PREFERRED replaces bash batch — 8 cmds, summarized",
 	smart_symbol: "⭐ PREFERRED replaces grep for symbols — LSP-lite",
@@ -145,22 +146,40 @@ const SMART_TOOL_META: Record<string, string> = {
 	smart_undo: "⟲ PREFERRED revert — atomic undo for smart_edit/write/bundle (undo stack)",
 };
 
+// Generic TTLCache — unifies 8 cache Maps + eviction (Delete: 7 duplicates removed)
+class TTLCache<K, V extends { at: number }> {
+  private m = new Map<K, V>();
+  constructor(private max: number, private ttl: number) {}
+  get(k: K): V | undefined { const v = this.m.get(k); if (!v) return undefined; if (Date.now() - v.at >= this.ttl) { this.m.delete(k); return undefined; } return v; }
+  set(k: K, v: V): void { this.m.set(k, v); this.evict(); }
+  delete(k: K): boolean { return this.m.delete(k); }
+  has(k: K): boolean { return this.get(k) !== undefined; }
+  clear(): void { this.m.clear(); }
+  get size(): number { return this.m.size; }
+  entries(): IterableIterator<[K, V]> { return this.m.entries(); }
+  keys(): IterableIterator<K> { return this.m.keys(); }
+  values(): IterableIterator<V> { return this.m.values(); }
+  private evict(): void { if (this.m.size <= this.max) return; const sorted = [...this.m.entries()].sort((a,b)=>a[1].at - b[1].at); for (let i=0;i<this.m.size - this.max;i++) this.m.delete(sorted[i][0]); }
+  // raw access for iteration without TTL check (used by status)
+  rawEntries(): IterableIterator<[K,V]> { return this.m.entries(); }
+}
+
 interface CacheEntry { content: string; mtimeMs: number; hash: string; at: number; size: number; }
-const readCache = new Map<string, CacheEntry>();
+const readCache = new TTLCache<string, CacheEntry>(CACHE_MAX, CACHE_TTL_MS);
 interface GrepCacheEntry { hits: Array<{file:string;line:number;preview:string}>; engine: string; at: number; query:string; }
-const grepCache = new Map<string, GrepCacheEntry>();
+const grepCache = new TTLCache<string, GrepCacheEntry>(GREPCACHE_MAX, GREPCACHE_TTL);
 interface GlobCacheEntry { files: string[]; at: number; pattern: string; }
-const globCache = new Map<string, GlobCacheEntry>();
+const globCache = new TTLCache<string, GlobCacheEntry>(GLOBCACHE_MAX, GLOBCACHE_TTL);
 interface DiffCacheEntry { diff: string; status: string; log: string; files: string[]; stat: string; at: number; key: string; }
-const diffCache = new Map<string, DiffCacheEntry>();
+const diffCache = new TTLCache<string, DiffCacheEntry>(DIFFCACHE_MAX, DIFFCACHE_TTL);
 interface ScanCacheEntry { entries: Array<{path:string; size:number; mtime:number; isDir:boolean}>; at: number; key: string; }
-const scanCache = new Map<string, ScanCacheEntry>();
+const scanCache = new TTLCache<string, ScanCacheEntry>(SCANCACHE_MAX, SCANCACHE_TTL);
 interface ExecCacheEntry { key: string; at: number; results: any; }
-const execCache = new Map<string, ExecCacheEntry>();
+const execCache = new TTLCache<string, ExecCacheEntry>(EXECCACHE_MAX, EXECCACHE_TTL);
 interface SymbolCacheEntry { text: string; details: any; at: number; }
-const symbolCache = new Map<string, SymbolCacheEntry>();
+const symbolCache = new TTLCache<string, SymbolCacheEntry>(SYMBOLCACHE_MAX, SYMBOLCACHE_TTL);
 interface CheckCacheEntry { text: string; details: any; at: number; }
-const checkCache = new Map<string, CheckCacheEntry>();
+const checkCache = new TTLCache<string, CheckCacheEntry>(CHECKCACHE_MAX, CHECKCACHE_TTL);
 interface UndoEntry { path: string; prevContent: string | null; nextContent: string | null; existed: boolean; at: number; op: string; }
 const undoHistory: UndoEntry[] = [];
 function stashUndo(path: string, prev: string | null, next: string | null, existed: boolean, op: string) {
@@ -170,7 +189,16 @@ function stashUndo(path: string, prev: string | null, next: string | null, exist
 let pendingTelemetry: Array<{type:string;data:any}> = [];
 let telemetryTimer: any = null;
 
+const _hashMemo = new Map<string,string>();
 function hashContent(s: string): string {
+	if (s.length < 10000) { // memo small strings per audit accelerate
+		const cached = _hashMemo.get(s);
+		if (cached) return cached;
+		const h = createHash("sha256").update(s, "utf8").digest("hex");
+		if (_hashMemo.size > 200) _hashMemo.clear();
+		_hashMemo.set(s, h);
+		return h;
+	}
 	return createHash("sha256").update(s, "utf8").digest("hex");
 }
 function resolveInsideCwd(cwd: string, p: string): string {
@@ -235,12 +263,7 @@ function syncSmartUI(ctx: any): void {
 		}
 	} catch {}
 }
-function touchCacheEvict(): void {
-	if (readCache.size <= CACHE_MAX) return;
-	const entries = [...readCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = readCache.size - CACHE_MAX;
-	for (let i=0;i<toDelete;i++) readCache.delete(entries[i][0]);
-}
+function touchCacheEvict(): void { /* TTLCache auto-evicts on set */ }
 function isCacheValid(entry: CacheEntry, mtimeMs: number, size?: number): boolean {
 	if (Date.now() - entry.at >= CACHE_TTL_MS) return false;
 	// mtime can be stale within 1ms on fast writes; size is primary, hash checked on read path
@@ -253,48 +276,13 @@ function isCacheValidWithHash(entry: CacheEntry, mtimeMs: number, size: number, 
 	if (freshHash && entry.hash !== freshHash) return false;
 	return true;
 }
-function touchGrepCacheEvict(): void {
-	if (grepCache.size <= GREPCACHE_MAX) return;
-	const entries = [...grepCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = grepCache.size - GREPCACHE_MAX;
-	for (let i=0;i<toDelete;i++) grepCache.delete(entries[i][0]);
-}
-function touchDiffCacheEvict(): void {
-	if (diffCache.size <= DIFFCACHE_MAX) return;
-	const entries = [...diffCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = diffCache.size - DIFFCACHE_MAX;
-	for (let i=0;i<toDelete;i++) diffCache.delete(entries[i][0]);
-}
-function touchExecCacheEvict(): void {
-	if (execCache.size <= EXECCACHE_MAX) return;
-	const entries = [...execCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = execCache.size - EXECCACHE_MAX;
-	for (let i=0;i<toDelete;i++) execCache.delete(entries[i][0]);
-}
-function touchSymbolCacheEvict(): void {
-	if (symbolCache.size <= SYMBOLCACHE_MAX) return;
-	const entries = [...symbolCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = symbolCache.size - SYMBOLCACHE_MAX;
-	for (let i=0;i<toDelete;i++) symbolCache.delete(entries[i][0]);
-}
-function touchCheckCacheEvict(): void {
-	if (checkCache.size <= CHECKCACHE_MAX) return;
-	const entries = [...checkCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = checkCache.size - CHECKCACHE_MAX;
-	for (let i=0;i<toDelete;i++) checkCache.delete(entries[i][0]);
-}
-function touchScanCacheEvict(): void {
-	if (scanCache.size <= SCANCACHE_MAX) return;
-	const entries = [...scanCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = scanCache.size - SCANCACHE_MAX;
-	for (let i=0;i<toDelete;i++) scanCache.delete(entries[i][0]);
-}
-function touchGlobCacheEvict(): void {
-	if (globCache.size <= GLOBCACHE_MAX) return;
-	const entries = [...globCache.entries()].sort((a,b)=>a[1].at - b[1].at);
-	const toDelete = globCache.size - GLOBCACHE_MAX;
-	for (let i=0;i<toDelete;i++) globCache.delete(entries[i][0]);
-}
+function touchGrepCacheEvict(): void { /* TTLCache auto-evicts */ }
+function touchDiffCacheEvict(): void { /* TTLCache auto-evicts */ }
+function touchExecCacheEvict(): void { /* TTLCache auto-evicts — also now opt-in */ }
+function touchSymbolCacheEvict(): void { /* TTLCache auto-evicts */ }
+function touchCheckCacheEvict(): void { /* TTLCache auto-evicts */ }
+function touchScanCacheEvict(): void { /* TTLCache auto-evicts */ }
+function touchGlobCacheEvict(): void { /* TTLCache auto-evicts */ }
 function normalizeDiffKey(opts: {staged?:boolean; stat?:boolean; base?:string; includeStatus?:boolean; includeLog?:boolean; maxBytes?:number}): string {
 	return `${opts.staged?1:0}::${opts.stat?1:0}::${(opts.base??"HEAD").trim()}::${opts.includeStatus?1:0}::${opts.includeLog?1:0}::${opts.maxBytes??20000}`;
 }
@@ -574,7 +562,7 @@ const smartReadFileEntry = Type.Union([
 	})
 ]);
 const smartReadParams = Type.Object({
-	files: Type.Array(smartReadFileEntry, { minItems: 1, maxItems: 8, description: "Up to 8 files per 1 LLM call — batch reads. Strings or {path, offset, limit, encoding}." }),
+	files: Type.Array(smartReadFileEntry, { minItems: 1, maxItems: 12, description: "Up to 12 files per 1 LLM call — batch reads. Strings or {path, offset, limit, encoding}." }),
 });
 export type SmartReadInput = Static<typeof smartReadParams>;
 
@@ -584,7 +572,7 @@ const smartWriteParams = Type.Object({
 			path: Type.String({ description: "File path relative to cwd" }),
 			content: Type.String({ description: "Full file content to write" }),
 		}),
-		{ minItems: 1, maxItems: 8, description: "Up to 8 files per 1 LLM call — batch writes" },
+		{ minItems: 1, maxItems: 12, description: "Up to 12 files per 1 LLM call — batch writes" },
 	),
 });
 export type SmartWriteInput = Static<typeof smartWriteParams>;
@@ -610,7 +598,7 @@ const searchSmartToolsParams = Type.Object({
 });
 
 const smartGlobParams = Type.Object({
-	patterns: Type.Array(Type.String({ description: "Glob pattern e.g. 'src/**/*.ts'" }), { minItems: 1, maxItems: 8, description: "Up to 8 glob patterns per call — batch" }),
+	patterns: Type.Array(Type.String({ description: "Glob pattern e.g. 'src/**/*.ts'" }), { minItems: 1, maxItems: 12, description: "Up to 12 glob patterns per call — batch" }),
 	path: Type.Optional(Type.String({ description: "Base directory to search in (default cwd)" })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max files per pattern (default 30)" })),
 	includeRead: Type.Optional(Type.Boolean({ description: "Auto read top unique files (default false) - fuses glob+read" })),
@@ -637,7 +625,7 @@ const smartDiffParams = Type.Object({
 export type SmartDiffInput = Static<typeof smartDiffParams>;
 
 const smartScanParams = Type.Object({
-	paths: Type.Array(Type.String({ description: "Directories to scan" }), { minItems: 1, maxItems: 8, description: "Up to 8 dirs per call" }),
+	paths: Type.Array(Type.String({ description: "Directories to scan" }), { minItems: 1, maxItems: 12, description: "Up to 12 dirs per call" }),
 	depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5, description: "Depth 1-5 (default 1)" })),
 	withStat: Type.Optional(Type.Boolean({ description: "Include size/mtime (default true)" })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max entries per dir (default 50)" })),
@@ -647,7 +635,7 @@ const smartScanParams = Type.Object({
 export type SmartScanInput = Static<typeof smartScanParams>;
 
 const smartExecParams = Type.Object({
-	commands: Type.Array(Type.Object({ cmd: Type.String({ description: "Bash command" }), timeout: Type.Optional(Type.Integer({ minimum: 2000, maximum: 120000 })), cwd: Type.Optional(Type.String()) }), { minItems: 1, maxItems: 8, description: "Up to 8 bash commands" }),
+	commands: Type.Array(Type.Object({ cmd: Type.String({ description: "Bash command" }), timeout: Type.Optional(Type.Integer({ minimum: 2000, maximum: 120000 })), cwd: Type.Optional(Type.String()), cache: Type.Optional(Type.Boolean({ description: "Cache result 30s (default false — opt-in, avoids stale tests)" })) }), { minItems: 1, maxItems: 12, description: "Up to 12 bash commands" }),
 	parallel: Type.Optional(Type.Boolean({ description: "Run parallel (default false)" })),
 	summarize: Type.Optional(Type.Boolean({ description: "Summarize fails (default true)" })),
 });
@@ -667,7 +655,7 @@ const smartCheckParams = Type.Object({
 export type SmartCheckInput = Static<typeof smartCheckParams>;
 
 const smartBundleParams = Type.Object({
-	reads: Type.Optional(Type.Array(smartReadFileEntry, { maxItems: 8, description: "Files to read — batch 8" })),
+	reads: Type.Optional(Type.Array(smartReadFileEntry, { maxItems: 12, description: "Files to read — batch 12" })),
 	greps: Type.Optional(Type.Array(Type.Object({
 		query: Type.String({ description: "Search pattern" }),
 		maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -677,7 +665,7 @@ const smartBundleParams = Type.Object({
 		pattern: Type.String({ description: "Glob pattern" }),
 		path: Type.Optional(Type.String()),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-	}), { maxItems: 8, description: "Globs — parallel (replaces glob)" })),
+	}), { maxItems: 12, description: "Globs — parallel (replaces glob)" })),
 	diffs: Type.Optional(Type.Array(Type.Object({
 		staged: Type.Optional(Type.Boolean()),
 		stat: Type.Optional(Type.Boolean()),
@@ -692,17 +680,18 @@ const smartBundleParams = Type.Object({
 		depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 		withStat: Type.Optional(Type.Boolean()),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-	}), { maxItems: 8, description: "Scans — ls/stat/tree" })),
+	}), { maxItems: 12, description: "Scans — ls/stat/tree" })),
 	execs: Type.Optional(Type.Array(Type.Object({
 		cmd: Type.String({ description: "Bash command" }),
 		timeout: Type.Optional(Type.Integer({ minimum: 2000, maximum: 120000 })),
 		cwd: Type.Optional(Type.String()),
-	}), { maxItems: 8, description: "Execs — bash batch" })),
+		cache: Type.Optional(Type.Boolean({ description: "Cache 30s opt-in (default false)" })),
+	}), { maxItems: 12, description: "Execs — bash batch" })),
 	symbols: Type.Optional(Type.Array(Type.Object({
 		query: Type.String({ description: "Symbol query" }),
 		kind: Type.Optional(Type.String()),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-	}), { maxItems: 8, description: "Symbols — LSP-lite" })),
+	}), { maxItems: 12, description: "Symbols — LSP-lite" })),
 	checks: Type.Optional(Type.Array(Type.Object({
 		checker: Type.Optional(Type.String()),
 		files: Type.Optional(Type.Array(Type.String())),
@@ -711,11 +700,11 @@ const smartBundleParams = Type.Object({
 		path: Type.String({ description: "File to edit" }),
 		edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1, maxItems: 8 }),
 		createIfMissing: Type.Optional(Type.Boolean()),
-	}), { maxItems: 8, description: "Edits per file — multi-file in one call" })),
+	}), { maxItems: 12, description: "Edits per file — multi-file in one call" })),
 	writes: Type.Optional(Type.Array(Type.Object({
 		path: Type.String(),
 		content: Type.String(),
-	}), { maxItems: 8, description: "Writes — parallel" })),
+	}), { maxItems: 12, description: "Writes — parallel" })),
 	dryRun: Type.Optional(Type.Boolean({ description: "Validate edits only, no write" })),
 	strict: Type.Optional(Type.Boolean({ description: "Reject fuzzy <0.85" })),
 });
@@ -930,14 +919,14 @@ function normalizeExecKey(cmd: string, cwd: string, exCwd?: string): string { re
 async function doExecOne(ex: any, cwd: string) {
 	const cmd = ex.cmd;
 	const timeout = Math.min(120000, Math.max(2000, ex.timeout ?? 30000));
+	const useCache = ex.cache === true || ex.useCache === true; // opt-in, default OFF per audit (avoids stale tests)
 	const cacheKey = normalizeExecKey(cmd, cwd, ex.cwd);
-	const cachedExec = execCache.get(cacheKey);
-	if (cachedExec && Date.now() - cachedExec.at < EXECCACHE_TTL) { state.execCacheHits += 1; return cachedExec.results; }
+	if (useCache) { const cachedExec = execCache.get(cacheKey); if (cachedExec && Date.now() - cachedExec.at < EXECCACHE_TTL) { state.execCacheHits += 1; return cachedExec.results; } }
 	const start = Date.now();
 	let output=""; let exitCode=0;
 	try { const targetCwd = ex.cwd ? resolveInsideCwd(cwd, ex.cwd) : cwd; let shell = process.platform === "win32" ? "cmd" : "/bin/bash"; let shellArgs = process.platform === "win32" ? ["/c", cmd] : ["-c", cmd]; const { stdout } = await execFile(shell, shellArgs, { cwd: targetCwd, timeout, maxBuffer: 2000000 } as any); output = String(stdout).slice(0,8000); } catch (e:any) { output = String((e as any).stdout||"")+String((e as any).stderr||"")+String((e as any).message||""); exitCode=1; output = output.slice(0,8000); }
 	const result = { cmd, exitCode, output, durationMs: Date.now()-start, truncated: output.length>=8000 };
-	execCache.set(cacheKey, { key: cacheKey, at: Date.now(), results: result }); touchExecCacheEvict();
+	if (useCache) { execCache.set(cacheKey, { key: cacheKey, at: Date.now(), results: result }); touchExecCacheEvict(); }
 	return result;
 }
 async function doCheckOne(ch: any, cwd: string) {
@@ -1104,7 +1093,7 @@ ${m.oldText.slice(0,400)}`)); }
 				}
 				stashUndo(params.path, curInside, next, existed, "smart_edit");
 				await writeFile(target, next, "utf8");
-				readCache.delete(params.path); readCache.delete(target);
+				readCache.delete(params.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear(); // invalidate on edit per audit
 				try { const st3 = await stat(target); readCache.set(params.path, { content: next, mtimeMs: (st3 as any).mtimeMs || Date.now(), hash: hashContent(next), at: Date.now(), size: next.length }); } catch {}
 				state.smartEdits += 1;
 				if (dedupSkipped) state.dedupSkipped += dedupSkipped;
@@ -2139,55 +2128,67 @@ const smartPatchTool = defineTool({
 				details: { ...details, injectedTimeout: rec.ms },
 			};
 		}
+		// merged smart enrichment (was second handler): ensure why+retry visible for smart_* failures
+		const sName = (event as any).toolName ?? "";
+		if (String(sName).startsWith("smart_")) {
+			const sContent = (event.content?.[0] as any)?.text ?? "";
+			const sIsError = (event as any).isError || sContent.includes("FAILED") || sContent.includes("Error") || sContent.includes("failed");
+			if (sIsError && !(sContent.includes("Why failed:") && sContent.includes("Retry:"))) {
+				const retryMap2: Record<string,string> = {
+					smart_diff: 'Retry: smart_diff {staged:false, stat:true} — check base ref exists, ensure inside git repo, reduce maxBytes if truncated.',
+					smart_exec: 'Retry: smart_exec {commands:[{cmd:"npm test"}]} — check cmd not empty, no rm -rf /, timeout 2s-120s.',
+					smart_symbol: 'Retry: smart_symbol {query:"foo"} — check query not empty, kind optional, reduce limit if no hits.',
+					smart_check: 'Retry: smart_check {checker:"tsc"} — ensure tsc installed, check files exist, use include for single file.',
+					smart_scan: 'Retry: smart_scan {paths:["src"] , depth:1} — check path inside cwd, depth 1-5, limit 1-100.',
+					smart_glob: 'Retry: smart_glob {patterns:["src/**/*.ts"]} — check glob syntax (*, **, ?), base path inside cwd, reduce limit if too many matches.',
+					smart_undo: 'Retry: smart_undo {path:"file.ts"} or {lastBundle:true} — ensure file was modified via smart_edit/write/bundle and undo history not empty (32 ops).',
+					smart_read: 'Retry: smart_read {files:["<path>"]} — verify path, use offset/limit, encoding:"base64" for binary.',
+					smart_write: 'Retry: smart_write {writes:[{path:"<path>", content:"..."}]} — check path relative to cwd, parent dir writable.',
+					smart_edit: 'Retry: smart_read first, copy exact 3-6 line anchor with unique symbol, then smart_edit with that oldText. Use dryRun:true to validate.',
+					smart_bundle: 'Retry: use smart_bundle {reads:[...], edits:[...]} with dryRun:true to validate before applying. Check each section error.',
+					smart_grep: 'Retry: smart_grep {query:"<pattern>", globs:["*.ts"]} — check regex syntax, reduce maxResults, add globs.',
+					smart_patch: 'Retry: ensure patch is valid unified diff (git diff) and file paths match. Fallback to smart_edit with anchors.'
+				};
+				const retry2 = retryMap2[sName] ?? 'Retry: re-read relevant files, fix anchor/path, then retry the operation.';
+				const why2 = sContent.slice(0, 500).replace(/\n/g, " ");
+				return { content: [{ type: "text", text: sContent + "\n\n" + failBlock(sName, why2 || "operation failed", retry2) }], details: { ...(event.details as any), smartToolsEnriched: true } };
+			}
+		}
 		return undefined;
 	});
 
-	// Smart-tools failure enrichment — ensure why+retry visible
-	pi.on("tool_result", async (event, _ctx) => {
-		const name = (event as any).toolName ?? "";
-		if (!String(name).startsWith("smart_")) return undefined;
-		const content = (event.content?.[0] as any)?.text ?? "";
-		const isError = (event as any).isError || content.includes("FAILED") || content.includes("Error") || content.includes("failed");
-		if (!isError) return undefined;
-		if (content.includes("Why failed:") && content.includes("Retry:")) return undefined;
-		const retryMap: Record<string,string> = {
-			smart_diff: 'Retry: smart_diff {staged:false, stat:true} — check base ref exists, ensure inside git repo, reduce maxBytes if truncated.',
-			smart_exec: 'Retry: smart_exec {commands:[{cmd:"npm test"}]} — check cmd not empty, no rm -rf /, timeout 2s-120s.',
-			smart_symbol: 'Retry: smart_symbol {query:"foo"} — check query not empty, kind optional, reduce limit if no hits.',
-			smart_check: 'Retry: smart_check {checker:"tsc"} — ensure tsc installed, check files exist, use include for single file.',
-			smart_scan: 'Retry: smart_scan {paths:["src"] , depth:1} — check path inside cwd, depth 1-5, limit 1-100.',
-			smart_glob: 'Retry: smart_glob {patterns:["src/**/*.ts"]} — check glob syntax (*, **, ?), base path inside cwd, reduce limit if too many matches.',
-			smart_undo: 'Retry: smart_undo {path:"file.ts"} or {lastBundle:true} — ensure file was modified via smart_edit/write/bundle and undo history not empty (32 ops).',
-			smart_read: 'Retry: smart_read {files:["<path>"]} — verify path, use offset/limit, encoding:"base64" for binary.',
-			smart_write: 'Retry: smart_write {writes:[{path:"<path>", content:"..."}]} — check path relative to cwd, parent dir writable.',
-			smart_edit: 'Retry: ' + "smart_read first, copy exact 3-6 line anchor with unique symbol, then smart_edit with that oldText. Use dryRun:true to validate.",
-			smart_bundle: 'Retry: use smart_bundle {reads:[...], edits:[...]} with dryRun:true to validate before applying. Check each section error.',
-			smart_grep: 'Retry: smart_grep {query:"<pattern>", globs:["*.ts"]} — check regex syntax, reduce maxResults, add globs.',
-			smart_patch: 'Retry: ensure patch is valid unified diff (git diff) and file paths match. Fallback to smart_edit with anchors.'
-		};
-		const retry = retryMap[name] ?? 'Retry: re-read relevant files, fix anchor/path, then retry the operation.';
-		const why = content.slice(0, 500).replace(/\n/g, " ");
-		return {
-			content: [{ type: "text", text: content + "\n\n" + failBlock(name, why || "operation failed", retry) }],
-			details: { ...(event.details as any), smartToolsEnriched: true }
-		};
-	});
-
-	// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 	// Commands — smart-status / smart-history (UX)
 	// -----------------------------------------------------------------------
 	pi.registerCommand("smart-status", {
 		description: "Show smart-tools status, telemetry and cache",
 		handler: async (_args, ctx) => {
 			const lines = [
-				`smart-tools status — ${describeSmart()} v3.0 (bundle flagship)`,
+				`smart-tools status — ${describeSmart()} v4.0 (bundle flagship)`,
 				`  bundle: ${state.smartBundles}  edits: ${state.smartEdits}  reads: ${state.smartReads} (hits:${state.cacheHits} miss:${state.cacheMisses} grepCache:${state.grepCacheHits})  writes:${state.smartWrites} (dedup:${state.dedupSkipped})`,
 				`  grep:${state.smartGreps} glob:${state.smartGlobs} diff:${state.smartDiffs} scan:${state.smartScans} patch:${state.smartPatches} undo:${state.smartUndos}  searches:${state.searches}`,
 				`  saved: ${state.callsSaved} calls ~${estimateTokens(state.tokensSavedEst*4)} tokens  bash injected:${state.bashInjected} timeouts:${state.timeoutsDetected}`,
-				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | diffCache ${diffCache.size}/${DIFFCACHE_MAX} TTL 10s | scanCache ${scanCache.size}/${SCANCACHE_MAX} TTL 30s | undo ${undoHistory.length}/${UNDO_MAX}`,
+				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | diffCache ${diffCache.size}/${DIFFCACHE_MAX} TTL 30s | scanCache ${scanCache.size}/${SCANCACHE_MAX} TTL 30s | execCache ${execCache.size}/${EXECCACHE_MAX} TTL 30s opt-in | undo ${undoHistory.length}/${UNDO_MAX}`,
 				`  widget: /smart-history for recent ops`,
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+	pi.registerCommand("smart-health", {
+		description: "Health check — tsc + git diff + scan in one bundle (audit automate)",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("smart-health: running tsc, diff, scan…", "info");
+			try {
+				const cwd = ctx.cwd;
+				const [tsc, diffStat, scan] = await Promise.all([
+					execFile("npx", ["tsc", "--noEmit", "--pretty", "false"], { cwd, timeout: 15000 } as any).then(r=> String((r as any).stdout||"") + String((r as any).stderr||"")).catch((e:any)=> String(e.stdout||"")+String(e.stderr||"")),
+					execFile("git", ["diff", "--stat"], { cwd, timeout: 5000 } as any).then(r=> String((r as any).stdout||"")).catch(()=> "no git"),
+					execFile("git", ["status", "--porcelain"], { cwd, timeout: 5000 } as any).then(r=> String((r as any).stdout||"")).catch(()=> ""),
+				]);
+				const tscOk = !tsc.includes("error TS");
+				const lines = [`smart-health ${tscOk?"✓ tsc pass":"✗ tsc fail"} — ${state.callsSaved} saved, ${state.cacheHits} hits`, `tsc: ${tsc.slice(0,800) || "(ok)"}`, `diff: ${diffStat.slice(0,500) || "(clean)"}`, `status: ${scan.slice(0,500) || "(clean)"}`];
+				ctx.ui.notify(lines.join("\n"), tscOk ? "info" : "warning");
+			} catch(e:any){ ctx.ui.notify(`smart-health failed: ${e.message}`, "error"); }
 		},
 	});
 	pi.registerCommand("smart-history", {
