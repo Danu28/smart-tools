@@ -171,7 +171,7 @@ let pendingTelemetry: Array<{type:string;data:any}> = [];
 let telemetryTimer: any = null;
 
 function hashContent(s: string): string {
-	return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
+	return createHash("sha256").update(s, "utf8").digest("hex");
 }
 function resolveInsideCwd(cwd: string, p: string): string {
 	const target = resolve(cwd, p);
@@ -295,11 +295,11 @@ function touchGlobCacheEvict(): void {
 	const toDelete = globCache.size - GLOBCACHE_MAX;
 	for (let i=0;i<toDelete;i++) globCache.delete(entries[i][0]);
 }
-function normalizeDiffKey(opts: {staged?:boolean; stat?:boolean; base?:string; includeStatus?:boolean; includeLog?:boolean}): string {
-	return `${opts.staged?1:0}::${opts.stat?1:0}::${(opts.base??"HEAD").trim()}::${opts.includeStatus?1:0}::${opts.includeLog?1:0}`;
+function normalizeDiffKey(opts: {staged?:boolean; stat?:boolean; base?:string; includeStatus?:boolean; includeLog?:boolean; maxBytes?:number}): string {
+	return `${opts.staged?1:0}::${opts.stat?1:0}::${(opts.base??"HEAD").trim()}::${opts.includeStatus?1:0}::${opts.includeLog?1:0}::${opts.maxBytes??20000}`;
 }
-function normalizeScanKey(paths: string[], depth?: number): string {
-	return `${paths.slice(0,8).join(",")}::${depth??1}`;
+function normalizeScanKey(paths: string[], depth?: number, limit?: number, withStat?: boolean): string {
+	return `${paths.slice(0,8).join(",")}::${depth??1}::${limit??50}::${withStat!==false?1:0}`;
 }
 function normalizeGlobKey(pattern: string, path?: string): string {
 	return `${pattern.trim()}::${(path??".").trim()}`;
@@ -747,7 +747,7 @@ async function doSmartReadFiles(entries: any[], cwd: string, onUpdate?: (m:any)=
 			const cached = readCache.get(file) ?? readCache.get(abs);
 			let content: string;
 			let fromCache = false;
-			if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz) && encoding === "utf8") {
+			if (cached && mtimeMs && isCacheValidWithHash(cached, mtimeMs, sz, cached.hash) && encoding === "utf8") {
 				content = cached.content;
 				fromCache = true;
 				cacheHits++;
@@ -761,7 +761,6 @@ async function doSmartReadFiles(entries: any[], cwd: string, onUpdate?: (m:any)=
 						return `## ${file} — binary file detected (null bytes), size ${formatSize(Buffer.byteLength(content))}, lines ${content.split("\n").length}. Use bash with hexdump or specify encoding:"base64" for small binaries.`;
 					}
 					readCache.set(file, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length });
-					readCache.set(abs, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length });
 					touchCacheEvict();
 				}
 			}
@@ -870,7 +869,7 @@ async function doGlobOne(pattern: string, cwd: string, basePath: string | undefi
 	try {
 		const fsp: any = await import("node:fs/promises");
 		if (typeof fsp.glob === "function") {
-			for await (const entry of fsp.glob(pattern, { cwd: root, withFileTypes: false, exclude: (p: any) => (p as any).name === ".git" || (p as any).name === "node_modules" })) {
+			for await (const entry of fsp.glob(pattern, { cwd: root, withFileTypes: false, exclude: (p: any) => { const name = typeof p === "string" ? String(p).split("/").pop() : (p as any).name; return name === ".git" || name === "node_modules"; } })) {
 				let rel = typeof entry === "string" ? entry as string : String(entry);
 				try { const abs = resolve(root, rel); const cwdAbs = resolve(cwd); if (abs.startsWith(cwdAbs + sep)) rel = abs.slice(cwdAbs.length + 1); } catch {}
 				files.push(rel.split(sep).join('/'));
@@ -927,13 +926,19 @@ async function doDiffOne(opts: any, cwd: string) {
 	return { ...entry, cached: false };
 }
 
+function normalizeExecKey(cmd: string, cwd: string, exCwd?: string): string { return `${cwd}::${exCwd??""}::${cmd.slice(0,200)}`; }
 async function doExecOne(ex: any, cwd: string) {
 	const cmd = ex.cmd;
 	const timeout = Math.min(120000, Math.max(2000, ex.timeout ?? 30000));
+	const cacheKey = normalizeExecKey(cmd, cwd, ex.cwd);
+	const cachedExec = execCache.get(cacheKey);
+	if (cachedExec && Date.now() - cachedExec.at < EXECCACHE_TTL) { state.execCacheHits += 1; return cachedExec.results; }
 	const start = Date.now();
 	let output=""; let exitCode=0;
-	try { const targetCwd = ex.cwd ? resolveInsideCwd(cwd, ex.cwd) : cwd; let shell = process.platform === "win32" ? "cmd" : "/bin/bash"; let shellArgs = process.platform === "win32" ? ["/c", cmd] : ["-c", cmd]; const { stdout } = await execFile(shell, shellArgs, { cwd: targetCwd, timeout, maxBuffer: 2000000 } as any).catch((e:any)=>({stdout: String(e.stdout||"")+String(e.stderr||"")} as any)); output = String(stdout).slice(0,8000); } catch (e:any) { output = String(e.stdout||"")+String(e.stderr||"")+String(e.message||""); exitCode=1; }
-	return { cmd, exitCode, output, durationMs: Date.now()-start, truncated: output.length>=8000 };
+	try { const targetCwd = ex.cwd ? resolveInsideCwd(cwd, ex.cwd) : cwd; let shell = process.platform === "win32" ? "cmd" : "/bin/bash"; let shellArgs = process.platform === "win32" ? ["/c", cmd] : ["-c", cmd]; const { stdout } = await execFile(shell, shellArgs, { cwd: targetCwd, timeout, maxBuffer: 2000000 } as any); output = String(stdout).slice(0,8000); } catch (e:any) { output = String((e as any).stdout||"")+String((e as any).stderr||"")+String((e as any).message||""); exitCode=1; output = output.slice(0,8000); }
+	const result = { cmd, exitCode, output, durationMs: Date.now()-start, truncated: output.length>=8000 };
+	execCache.set(cacheKey, { key: cacheKey, at: Date.now(), results: result }); touchExecCacheEvict();
+	return result;
 }
 async function doCheckOne(ch: any, cwd: string) {
 	const checker = ch.checker ?? "tsc";
@@ -943,7 +948,7 @@ async function doCheckOne(ch: any, cwd: string) {
 	return { checker, count: errors, output: output.slice(0,4000) };
 }
 async function doScanOne(dir: any, cwd: string, depth: any, limit: any, withStat: any) {
-	const key = normalizeScanKey([dir], depth);
+	const key = normalizeScanKey([dir], depth, limit, withStat);
 	const cached = scanCache.get(key);
 	if (cached && Date.now() - cached.at < SCANCACHE_TTL) { state.scanCacheHits += 1; return { entries: cached.entries.slice(0, limit), cached: true }; }
 	const target = resolveInsideCwd(cwd, dir || ".");
@@ -970,7 +975,7 @@ async function doScanOne(dir: any, cwd: string, depth: any, limit: any, withStat
 		};
 		await walk(target, 1);
 	} catch {}
-	if (withStat !== false) entries.sort((a,b)=> b.mtime - a.mtime);
+	if (withStat !== false && entries.length) entries.sort((a,b)=> b.mtime - a.mtime);
 	const sliced = entries.slice(0, limit ?? 50);
 	scanCache.set(key, { entries: sliced.slice(), at: Date.now(), key }); touchScanCacheEvict();
 	return { entries: sliced, cached: false };
@@ -1077,10 +1082,8 @@ ${m.oldText.slice(0,400)}`)); }
 					if (params.replaceAll) {
 						// replaceAll mode: global string replace per edit (exact), bypasses fuzzy/overlap checks
 						let tmp = curInside; let totalApplied = 0; const tmpApplied: ValidatedEdit[] = []; let tmpDedup = 0;
-						for (let i=0;i<params.edits.length;i++) { const e = (params.edits as any[])[i]; if (e.oldText === "") { tmp += (tmp.endsWith("\n") || tmp === "" ? "" : "\n") + e.newText; tmpApplied.push({ index:i, oldText:e.oldText, newText:e.newText, hit:{ idx: tmp.length, confidence:1, strategy:"append", startLine: tmp.split("\n").length, endLine: tmp.split("\n").length, length:0 }, found:true, isAppend:true } as any); totalApplied++; continue; } if (e.oldText === e.newText) { tmpDedup++; continue; } const parts = tmp.split(e.oldText); if (parts.length <=1) { // try fuzzy single occurrence as fallback
-							const hit = findFuzzyDetailed(tmp, e.oldText); if (!hit) throw new Error(failBlock("smart_edit", `oldText not found for replaceAll (edit ${i})`, retryHintForEdit()));
-							// replace fuzzy hit once
-							const before = tmp.slice(0, hit.idx); const after = tmp.slice(hit.idx + hit.length); tmp = before + e.newText + after;
+						for (let i=0;i<params.edits.length;i++) { const e = (params.edits as any[])[i]; if (e.oldText === "") { tmp += (tmp.endsWith("\n") || tmp === "" ? "" : "\n") + e.newText; tmpApplied.push({ index:i, oldText:e.oldText, newText:e.newText, hit:{ idx: tmp.length, confidence:1, strategy:"append", startLine: tmp.split("\n").length, endLine: tmp.split("\n").length, length:0 }, found:true, isAppend:true } as any); totalApplied++; continue; } if (e.oldText === e.newText) { tmpDedup++; continue; } const parts = tmp.split(e.oldText); if (parts.length <=1) { // try fuzzy: replace all fuzzy occurrences
+							let fuzzyReplaced = 0; let searchTmp = tmp; let resultTmp = ""; while (true) { const hit = findFuzzyDetailed(searchTmp, e.oldText); if (!hit) break; const before = searchTmp.slice(0, hit.idx); const after = searchTmp.slice(hit.idx + hit.length); resultTmp += before + e.newText; searchTmp = after; fuzzyReplaced++; if (fuzzyReplaced > 100) break; } if (fuzzyReplaced === 0) throw new Error(failBlock("smart_edit", `oldText not found for replaceAll (edit ${i})`, retryHintForEdit())); resultTmp += searchTmp; tmp = resultTmp;
 						} else {
 							tmp = parts.join(e.newText);
 						}
@@ -1184,8 +1187,9 @@ ${m.oldText.slice(0,400)}`)); }
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const entries = params.files.slice(0, 8).map((f: any) => typeof f === "string" ? { path: f, offset: undefined as number|undefined, limit: undefined as number|undefined, encoding: "utf8" as const } : { path: (f as any).path, offset: (f as any).offset, limit: (f as any).limit, encoding: ((f as any).encoding ?? "utf8") as "utf8"|"base64" });
 			const { texts: reads, cacheHits: cacheHitsThisCall, perFileBudget } = await doSmartReadFiles(entries, ctx.cwd, onUpdate as any);
-			state.smartReads += 1;
-			if (cacheHitsThisCall) state.cacheHits += cacheHitsThisCall; else state.cacheMisses += entries.length;
+			state.smartReads += entries.length;
+			state.cacheHits += cacheHitsThisCall;
+			state.cacheMisses += (entries.length - cacheHitsThisCall);
 			if (entries.length > 1) { state.callsSaved += (entries.length - 1); state.tokensSavedEst += estimateTokens(entries.length * 300); }
 			scheduleTelemetry(piRef, "smart-tools:smart_read", { files: params.files, at: Date.now(), cacheHits: cacheHitsThisCall });
 			syncSmartUI(ctx);
@@ -1239,13 +1243,13 @@ ${m.oldText.slice(0,400)}`)); }
 				return withFileMutationQueue(target, async () => {
 					let existing: string | null = null;
 					try { existing = await readFile(target, "utf8"); } catch {}
-					if (existing !== null && hashContent(existing) === hashContent(w.content)) {
+					if (existing !== null && existing === w.content) {
 						results.push({ path: w.path, bytes: w.content.length, skipped: true, reason: "unchanged (hash equal)" });
 						state.dedupSkipped += 1;
 						return;
 					}
 					try { const prevForUndo = existing; const existedForUndo = existing !== null; stashUndo(w.path, prevForUndo, w.content, existedForUndo, "smart_write"); await mkdir(dirname(target), { recursive: true }); await writeFile(target, w.content, "utf8"); } catch (e:any) { const cls = classifyFsError(e, w.path); throw new Error(failBlock("smart_write", cls.why, cls.retry)); }
-					readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear(); globCache.clear();
+					readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
 					results.push({ path: w.path, bytes: w.content.length });
 				});
 			}));
@@ -1316,7 +1320,7 @@ ${m.oldText.slice(0,400)}`)); }
 						let mtimeMs = 0, sz = 0;
 						try { const st = await stat(abs); mtimeMs = (st as any).mtimeMs; sz = (st as any).size; } catch {}
 						const cached = readCache.get(f) ?? readCache.get(abs);
-						if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz)) { content = cached.content; state.cacheHits++; } else { content = await readFile(abs, "utf8"); readCache.set(f, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); readCache.set(abs, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); touchCacheEvict(); state.cacheMisses++; }
+						if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz)) { content = cached.content; state.cacheHits++; } else { content = await readFile(abs, "utf8"); readCache.set(f, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); touchCacheEvict(); state.cacheMisses++; }
 						const lines = content.split("\n");
 						const hitLine = hitsOut.find(h=>h.file===f)?.line ?? 1;
 						const center = Math.max(0, hitLine - 1);
@@ -1379,7 +1383,7 @@ ${m.oldText.slice(0,400)}`)); }
 						let content: string; let mtimeMs = 0, sz = 0;
 						try { const st = await stat(abs); mtimeMs = (st as any).mtimeMs; sz = (st as any).size; } catch {}
 						const cached = readCache.get(f) ?? readCache.get(abs);
-						if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz)) { content = cached.content; state.cacheHits++; } else { content = await readFile(abs, "utf8"); readCache.set(f, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); readCache.set(abs, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); touchCacheEvict(); state.cacheMisses++; }
+						if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz)) { content = cached.content; state.cacheHits++; } else { content = await readFile(abs, "utf8"); readCache.set(f, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); touchCacheEvict(); state.cacheMisses++; }
 						const lines = content.split("\n");
 						const slice = lines.slice(0, readLimit).join("\n");
 						const trunc = truncateTail(slice, { maxLines: readLimit, maxBytes: 8000 });
@@ -1417,7 +1421,10 @@ ${m.oldText.slice(0,400)}`)); }
 			onUpdate?.({ message: "smart_undo: searching history" } as any);
 			const steps = Math.min(10, Math.max(1, params.steps ?? 1));
 			if (params.lastBundle) {
-				const bundleEntries = [...undoHistory].reverse().filter(e=> e.op.includes("bundle") || e.op === "smart_bundle").slice(0, 8);
+				// Find most recent bundleId, undo only that group
+			const lastBundleOp = [...undoHistory].reverse().find(e=> e.op.startsWith("smart_bundle:"));
+			const lastBundleId = lastBundleOp ? lastBundleOp.op.split(":")[1] : null;
+			const bundleEntries = lastBundleId ? [...undoHistory].filter(e=> e.op === `smart_bundle:${lastBundleId}`) : [...undoHistory].reverse().filter(e=> e.op.includes("bundle")).slice(0, 8);
 				if (!bundleEntries.length) {
 					const fallback = [...undoHistory].reverse().slice(0, 8);
 					if (!fallback.length) throw new Error(failBlock("smart_undo", "undo history empty — nothing to revert", "Make an edit/write/bundle first, then undo."));
@@ -1811,6 +1818,7 @@ const smartPatchTool = defineTool({
 			if (params.writes && params.writes.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `writes max ${BUNDLE_MAX} exceeded`, `Reduce writes to <=${BUNDLE_MAX} per call.`));
 			const sections: string[] = [];
 			const bundleDetails: any = {};
+			const bundleId = randomUUID(); // grouping for undo
 			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + ((params as any).globs?.length??0) + ((params as any).diffs?.length??0) + ((params as any).scans?.length??0) + ((params as any).execs?.length??0) + ((params as any).symbols?.length??0) + ((params as any).checks?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
 			if (hasGreps) {
 				onUpdate?.({ message: `smart_bundle: ${params.greps!.length} grep(s)` } as any);
@@ -1882,8 +1890,9 @@ const smartPatchTool = defineTool({
 				onUpdate?.({ message: `smart_bundle: ${params.reads!.length} read(s)` } as any);
 				const entries = params.reads!.slice(0, BUNDLE_MAX);
 				const { texts, cacheHits } = await doSmartReadFiles(entries as any[], ctx.cwd, onUpdate as any);
-				state.smartReads += 1;
-				if (cacheHits) state.cacheHits += cacheHits; else state.cacheMisses += entries.length;
+				state.smartReads += entries.length;
+				state.cacheHits += cacheHits;
+				state.cacheMisses += (entries.length - cacheHits);
 				bundleDetails.reads = { count: entries.length, cacheHits };
 				sections.push(`--- bundle reads (${entries.length}, cached ${cacheHits}) ---`);
 				sections.push(...texts);
@@ -1891,7 +1900,7 @@ const smartPatchTool = defineTool({
 			if (hasEdits) {
 				onUpdate?.({ message: `smart_bundle: ${params.edits!.length} edit file(s)` } as any);
 				const editResults: Array<{path:string; applied:number; bytes:number; dedup:number; noOp?:boolean; dryRun?:boolean; suggestion?:any}> = [];
-				let editFail: Error | null = null;
+				// editFail replaced by allSettled handling
 				if (params.dryRun) {
 					for (const ef of params.edits!) {
 						const target = resolveInsideCwd(ctx.cwd, ef.path);
@@ -1902,10 +1911,9 @@ const smartPatchTool = defineTool({
 						sections.push(`dryRun ${ef.path}: ${wouldApply?"✓ would apply":"✗ would fail"} — ${ef.edits.length} edit(s) overlaps:${v.overlaps.length} missing:${v.missing.length}`);
 					}
 				} else {
-					await Promise.all(params.edits!.map(async (ef: any)=>{
+					const editSettled = await Promise.allSettled(params.edits!.map(async (ef: any)=>{
 						const target = resolveInsideCwd(ctx.cwd, ef.path);
-						try {
-							await withFileMutationQueue(target, async()=>{
+						await withFileMutationQueue(target, async()=>{
 								let cur = ""; try { cur = await readFile(target, "utf8"); } catch (e:any) { if ((e as NodeJS.ErrnoException).code !== "ENOENT" || ef.createIfMissing === false) throw e; cur = ""; }
 								let v = validateEdits(cur, ef.edits);
 								if (v.missing.length) { try { const fresh = await readFile(target, "utf8"); if (fresh !== cur) { const v2 = validateEdits(fresh, ef.edits); if (v2.missing.length < v.missing.length) { cur = fresh; v = v2; } } } catch {} }
@@ -1914,19 +1922,19 @@ const smartPatchTool = defineTool({
 								let next: string, applied: any, dedupSkipped: number, lowConfidence: any;
 								if ((params as any).replaceAll || (ef as any).replaceAll) {
 								let tmp = cur; const tmpApplied:any[]=[]; let tmpDedup=0;
-								for (const e of ef.edits as any[]) { if (e.oldText==="") { tmp += (tmp.endsWith(String.fromCharCode(10))||tmp===""?"":String.fromCharCode(10))+e.newText; tmpApplied.push({index:0, oldText:e.oldText, newText:e.newText} as any); continue; } if (e.oldText===e.newText){tmpDedup++; continue;} const parts=tmp.split(e.oldText); if(parts.length>1) tmp=parts.join(e.newText); else { const hit=findFuzzyDetailed(tmp,e.oldText); if(!hit) throw new Error(failBlock("smart_bundle", `oldText not found in ${ef.path}`, retryHintForEdit())); const before=tmp.slice(0,hit.idx); const after=tmp.slice(hit.idx+hit.length); tmp=before+e.newText+after; } tmpApplied.push({index:0, oldText:e.oldText,newText:e.newText} as any); }
+								for (const e of ef.edits as any[]) { if (e.oldText==="") { tmp += (tmp.endsWith(String.fromCharCode(10))||tmp===""?"":String.fromCharCode(10))+e.newText; tmpApplied.push({index:0, oldText:e.oldText, newText:e.newText} as any); continue; } if (e.oldText===e.newText){tmpDedup++; continue;} const parts=tmp.split(e.oldText); if(parts.length>1) tmp=parts.join(e.newText); else { let fuzzyReplaced=0; let searchTmp=tmp; let resultTmp=""; while(true){ const hit=findFuzzyDetailed(searchTmp,e.oldText); if(!hit) break; const before=searchTmp.slice(0,hit.idx); const after=searchTmp.slice(hit.idx+hit.length); resultTmp+=before+e.newText; searchTmp=after; fuzzyReplaced++; if(fuzzyReplaced>100) break; } if(fuzzyReplaced===0) throw new Error(failBlock("smart_bundle", `oldText not found in ${ef.path}`, retryHintForEdit())); resultTmp+=searchTmp; tmp=resultTmp; } tmpApplied.push({index:0, oldText:e.oldText,newText:e.newText} as any); }
 								next=tmp; applied=tmpApplied; dedupSkipped=tmpDedup; lowConfidence=[];
 							} else { const res = applyEditsAtomic(cur, ef.edits, { strict: params.strict }); next=res.next; applied=res.applied; dedupSkipped=res.dedupSkipped; lowConfidence=res.lowConfidence; }
 								if (next === cur) { editResults.push({ path: ef.path, applied: 0, bytes: cur.length, dedup: dedupSkipped, noOp:true }); state.dedupSkipped += dedupSkipped || 1; return; }
-								stashUndo(ef.path, cur, next, true, "smart_bundle");
+								stashUndo(ef.path, cur, next, true, `smart_bundle:${bundleId}`);
 								await mkdir(dirname(target), { recursive: true }); await writeFile(target, next, "utf8");
 								readCache.delete(ef.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
 								editResults.push({ path: ef.path, applied: applied.length, bytes: next.length, dedup: dedupSkipped, suggestion: lowConfidence.length? lowConfidence.map((l:any)=>({i:l.index,c:l.hit!.confidence,s:l.hit!.strategy})):undefined });
 								if (dedupSkipped) state.dedupSkipped += dedupSkipped;
 							});
-						} catch (e:any) { editFail = e; }
 					}));
-					if (editFail) throw editFail;
+					const editFailures = editSettled.filter(r=> r.status==="rejected") as PromiseRejectedResult[];
+					if (editFailures.length) throw (editFailures[0] as any).reason;
 					state.smartEdits += params.edits!.length;
 					const totalEdits = params.edits!.reduce((s: number,ef: any)=>s+ef.edits.length,0);
 					if (totalEdits > params.edits!.length) { state.callsSaved += (totalEdits - params.edits!.length); }
@@ -1944,8 +1952,8 @@ const smartPatchTool = defineTool({
 					const target = resolveInsideCwd(ctx.cwd, w.path);
 					return withFileMutationQueue(target, async()=>{
 						let existing: string|null=null; try { existing = await readFile(target,"utf8"); } catch {}
-						if (existing !== null && hashContent(existing)===hashContent(w.content)) { results.push({path:w.path, bytes:w.content.length, skipped:true}); state.dedupSkipped+=1; return; }
-						stashUndo(w.path, existing, w.content, existing !== null, "smart_bundle");
+						if (existing !== null && existing === w.content) { results.push({path:w.path, bytes:w.content.length, skipped:true}); state.dedupSkipped+=1; return; }
+						stashUndo(w.path, existing, w.content, existing !== null, `smart_bundle:${bundleId}`);
 						await mkdir(dirname(target),{recursive:true}); await writeFile(target,w.content,"utf8");
 						readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
 						results.push({path:w.path, bytes:w.content.length});
@@ -2236,7 +2244,7 @@ const smartPatchTool = defineTool({
 				if (top.length) {
 					await Promise.all(top.map(async (f)=>{
 						const abs = resolveInsideCwd(ctx.cwd, f);
-						try { const st = await stat(abs); const c = await readFile(abs, "utf8"); readCache.set(f, { content: c, mtimeMs: (st as any).mtimeMs || Date.now(), hash: hashContent(c), at: Date.now(), size: c.length }); readCache.set(abs, { content: c, mtimeMs: (st as any).mtimeMs || Date.now(), hash: hashContent(c), at: Date.now(), size: c.length }); } catch {}
+						try { const st = await stat(abs); const c = await readFile(abs, "utf8"); readCache.set(f, { content: c, mtimeMs: (st as any).mtimeMs || Date.now(), hash: hashContent(c), at: Date.now(), size: c.length }); } catch {}
 					}));
 					touchCacheEvict();
 				}
