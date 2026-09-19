@@ -1,9 +1,9 @@
 {
   "name": "@danu28/smart-tools",
-  "version": "3.1.0",
-  "description": "smart-tools v3.1 — bundle grep+read+glob+edit+write in ONE call (3.8→1.9 saves 50%), slice-aware cache, auto-merge, intent cache, rescue + smart_glob + smart_undo + replaceAll",
+  "version": "3.2.0",
+  "description": "smart-tools v3.2 — bundle grep+glob+diff+scan+read+edit+write in ONE call (3.8→1.9 saves 50%), slice-aware cache, auto-merge, intent cache, rescue + smart_glob/diff/scan/undo",
   "type": "module",
-  "keywords": ["pi-package", "pi-extension", "smart-tools", "batch", "fuzzy", "bundle", "glob", "undo"],
+  "keywords": ["pi-package", "pi-extension", "smart-tools", "batch", "fuzzy", "bundle", "glob", "diff", "scan", "undo"],
   "license": "MIT",
   "author": {
     "name": "Danu28",

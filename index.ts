@@ -1,5 +1,5 @@
 /**
- * smart-tools v3.1 — batching + fuzzy edits + productivity suite
+ * smart-tools v3.2 — batching + fuzzy edits + productivity suite
  *
  * Gaps solved:
  *  1. edit/read/write N:1 batching + whitespace -> smart_edit/smart_read/smart_write (8 per 1 LLM call, fuzzy, queue-safe)
@@ -13,6 +13,7 @@
  *  9. invisible cost           -> LRU read cache (32/5min slice-aware) + grep intent cache + single telemetry flush + prefetch
  *  10. cryptic UX              -> rich status widget + /smart-status + /smart-history + streaming
  *
+ * v3.2: + smart_diff (git diff/status/log cache 10s) + smart_scan (ls/stat/tree batch 8) + bundle diffs/scans
  * v3.1: + smart_glob (glob 8:1 + intent cache + includeRead) + smart_undo (atomic revert) + smart_edit replaceAll
  * v3.0: smart_bundle heterogeneous 1-call (grep+read+edit+write), slice-aware cache, auto-merge, rescue, adaptive budget
  * Goal: 3.8 → 1.9 calls/task (-50%) without quality drop.
@@ -53,6 +54,8 @@ interface SmartState {
 	smartWrites: number;
 	smartGreps: number;
 	smartGlobs: number;
+	smartDiffs: number;
+	smartScans: number;
 	smartPatches: number;
 	smartBundles: number;
 	smartUndos: number;
@@ -65,6 +68,8 @@ interface SmartState {
 	timeoutsDetected: number;
 	grepCacheHits: number;
 	globCacheHits: number;
+	diffCacheHits: number;
+	scanCacheHits: number;
 }
 const state: SmartState = {
 	bashInjected: 0,
@@ -73,6 +78,8 @@ const state: SmartState = {
 	smartWrites: 0,
 	smartGreps: 0,
 	smartGlobs: 0,
+	smartDiffs: 0,
+	smartScans: 0,
 	smartPatches: 0,
 	smartBundles: 0,
 	smartUndos: 0,
@@ -85,6 +92,8 @@ const state: SmartState = {
 	timeoutsDetected: 0,
 	grepCacheHits: 0,
 	globCacheHits: 0,
+	diffCacheHits: 0,
+	scanCacheHits: 0,
 };
 
 const MAX_OLDTEXT = 50_000;
@@ -94,16 +103,22 @@ const GREPCACHE_TTL = 60_000;
 const GREPCACHE_MAX = 50;
 const GLOBCACHE_TTL = 60_000;
 const GLOBCACHE_MAX = 50;
+const DIFFCACHE_TTL = 10_000;
+const DIFFCACHE_MAX = 20;
+const SCANCACHE_TTL = 30_000;
+const SCANCACHE_MAX = 50;
 const UNDO_MAX = 32;
 const BUNDLE_MAX = 8;
-const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch", "smart_glob"]);
-const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_patch", "smart_bundle", "smart_undo"]);
+const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch", "smart_glob", "smart_diff", "smart_scan"]);
+const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_diff", "smart_scan", "smart_patch", "smart_bundle", "smart_undo"]);
 const SMART_TOOL_META: Record<string, string> = {
 	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
 	smart_write: "⭐ PREFERRED replaces write — batch 8, dedup, queue-safe",
 	smart_edit: "⭐ PREFERRED replaces edit — batch 8, fuzzy 0.72, auto-rescue",
 	smart_grep: "⭐ PREFERRED replaces bash grep — rg bridge, cached, includeRead",
 	smart_glob: "⭐ PREFERRED replaces glob — batch 8 patterns, mtime-sorted, cached, includeRead",
+	smart_diff: "⭐ PREFERRED replaces bash git diff/status/log — cached 10s, staged/stat/base",
+	smart_scan: "⭐ PREFERRED replaces bash ls/tree/stat — batch 8 dirs, depth, stat, mtime-sorted",
 	smart_patch: "⭐ PREFERRED replaces bash git apply — atomic + fallback",
 	smart_bundle: "⭐⭐ STRONGLY PREFERRED replaces all — bundle 8 per type, -50% calls",
 	smart_undo: "⟲ PREFERRED revert — atomic undo for smart_edit/write/bundle (undo stack)",
@@ -115,6 +130,10 @@ interface GrepCacheEntry { hits: Array<{file:string;line:number;preview:string}>
 const grepCache = new Map<string, GrepCacheEntry>();
 interface GlobCacheEntry { files: string[]; at: number; pattern: string; }
 const globCache = new Map<string, GlobCacheEntry>();
+interface DiffCacheEntry { diff: string; status: string; log: string; files: string[]; stat: string; at: number; key: string; }
+const diffCache = new Map<string, DiffCacheEntry>();
+interface ScanCacheEntry { entries: Array<{path:string; size:number; mtime:number; isDir:boolean}>; at: number; key: string; }
+const scanCache = new Map<string, ScanCacheEntry>();
 interface UndoEntry { path: string; prevContent: string | null; nextContent: string | null; existed: boolean; at: number; op: string; }
 const undoHistory: UndoEntry[] = [];
 function stashUndo(path: string, prev: string | null, next: string | null, existed: boolean, op: string) {
@@ -144,7 +163,7 @@ function renderStatus(theme: any): string {
 	return `${dot}${label}${hint}`;
 }
 function renderWidgetLines(theme: any): string[] {
-	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartGlobs===0 && state.smartPatches===0 && state.smartBundles===0 && state.smartUndos===0 && state.callsSaved===0;
+	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartGlobs===0 && state.smartDiffs===0 && state.smartScans===0 && state.smartPatches===0 && state.smartBundles===0 && state.smartUndos===0 && state.callsSaved===0;
 	if (idle) {
 		return [ `${theme.fg("dim", "◇")} ${theme.fg("accent","smart-tools")} ${theme.fg("dim","·")} ${theme.fg("muted","batch 8:1 · fuzzy edits · queue-safe · 30s timeout")}` ];
 	}
@@ -155,6 +174,8 @@ function renderWidgetLines(theme: any): string[] {
 	if (state.smartWrites) parts.push(`${theme.fg("muted","writes")} ${theme.fg("accent", String(state.smartWrites))}${state.dedupSkipped ? theme.fg("dim", ` ≡${state.dedupSkipped}`) : ""}`);
 	if (state.smartGreps) parts.push(`${theme.fg("muted","grep")} ${theme.fg("accent", String(state.smartGreps))}${state.grepCacheHits? theme.fg("success", ` ↻${state.grepCacheHits}`):""}`);
 	if (state.smartGlobs) parts.push(`${theme.fg("muted","glob")} ${theme.fg("accent", String(state.smartGlobs))}${state.globCacheHits? theme.fg("success", ` ↻${state.globCacheHits}`):""}`);
+	if (state.smartDiffs) parts.push(`${theme.fg("muted","diff")} ${theme.fg("accent", String(state.smartDiffs))}${state.diffCacheHits? theme.fg("success", ` ↻${state.diffCacheHits}`):""}`);
+	if (state.smartScans) parts.push(`${theme.fg("muted","scan")} ${theme.fg("accent", String(state.smartScans))}${state.scanCacheHits? theme.fg("success", ` ↻${state.scanCacheHits}`):""}`);
 	if (state.smartPatches) parts.push(`${theme.fg("muted","patch")} ${theme.fg("accent", String(state.smartPatches))}`);
 	if (state.smartUndos) parts.push(`${theme.fg("muted","undo")} ${theme.fg("accent", String(state.smartUndos))}`);
 	const line1 = `${theme.fg("accent","◇ smart-tools")}  ${theme.fg("dim","│")}  ${parts.join(theme.fg("dim"," · "))}`;
@@ -170,7 +191,7 @@ function describeSmart(): string { return `smart-tools · ${state.callsSaved ? s
 function widgetLines(): string[] {
 	const a: string[] = [];
 	a.push(`smart-tools  bundles:${state.smartBundles} edits:${state.smartEdits}  reads:${state.smartReads}${state.cacheHits ? ` (${state.cacheHits} cache hit)` : ""}  writes:${state.smartWrites}${state.dedupSkipped ? ` (${state.dedupSkipped} no-op skip)` : ""}`);
-	if (state.smartGreps || state.smartGlobs || state.smartPatches || state.searches || state.smartUndos) a.push(`grep:${state.smartGreps} glob:${state.smartGlobs} patch:${state.smartPatches} undo:${state.smartUndos} search:${state.searches}`);
+	if (state.smartGreps || state.smartGlobs || state.smartDiffs || state.smartScans || state.smartPatches || state.searches || state.smartUndos) a.push(`grep:${state.smartGreps} glob:${state.smartGlobs} diff:${state.smartDiffs} scan:${state.smartScans} patch:${state.smartPatches} undo:${state.smartUndos} search:${state.searches}`);
 	if (state.callsSaved) a.push(`saved ~${state.callsSaved} LLM calls · ~${estimateTokens(state.tokensSavedEst*4)} tokens · bash injected:${state.bashInjected}`);
 	else a.push(`batch 8:1 · fuzzy edits · queue-safe · timeout 30s`);
 	return a;
@@ -211,11 +232,29 @@ function touchGrepCacheEvict(): void {
 	const toDelete = grepCache.size - GREPCACHE_MAX;
 	for (let i=0;i<toDelete;i++) grepCache.delete(entries[i][0]);
 }
+function touchDiffCacheEvict(): void {
+	if (diffCache.size <= DIFFCACHE_MAX) return;
+	const entries = [...diffCache.entries()].sort((a,b)=>a[1].at - b[1].at);
+	const toDelete = diffCache.size - DIFFCACHE_MAX;
+	for (let i=0;i<toDelete;i++) diffCache.delete(entries[i][0]);
+}
+function touchScanCacheEvict(): void {
+	if (scanCache.size <= SCANCACHE_MAX) return;
+	const entries = [...scanCache.entries()].sort((a,b)=>a[1].at - b[1].at);
+	const toDelete = scanCache.size - SCANCACHE_MAX;
+	for (let i=0;i<toDelete;i++) scanCache.delete(entries[i][0]);
+}
 function touchGlobCacheEvict(): void {
 	if (globCache.size <= GLOBCACHE_MAX) return;
 	const entries = [...globCache.entries()].sort((a,b)=>a[1].at - b[1].at);
 	const toDelete = globCache.size - GLOBCACHE_MAX;
 	for (let i=0;i<toDelete;i++) globCache.delete(entries[i][0]);
+}
+function normalizeDiffKey(opts: {staged?:boolean; stat?:boolean; base?:string; includeStatus?:boolean; includeLog?:boolean}): string {
+	return `${opts.staged?1:0}::${opts.stat?1:0}::${(opts.base??"HEAD").trim()}::${opts.includeStatus?1:0}::${opts.includeLog?1:0}`;
+}
+function normalizeScanKey(paths: string[], depth?: number): string {
+	return `${paths.slice(0,8).join(",")}::${depth??1}`;
 }
 function normalizeGlobKey(pattern: string, path?: string): string {
 	return `${pattern.trim()}::${(path??".").trim()}`;
@@ -541,6 +580,27 @@ const smartUndoParams = Type.Object({
 });
 export type SmartUndoInput = Static<typeof smartUndoParams>;
 
+const smartDiffParams = Type.Object({
+	staged: Type.Optional(Type.Boolean({ description: "Show staged diff (git diff --cached)" })),
+	stat: Type.Optional(Type.Boolean({ description: "Include --stat" })),
+	base: Type.Optional(Type.String({ description: "Base ref for diff (default HEAD)" })),
+	maxBytes: Type.Optional(Type.Integer({ minimum: 1000, maximum: 100000, description: "Max diff bytes (default 20000)" })),
+	includeStatus: Type.Optional(Type.Boolean({ description: "Include git status --porcelain (default true)" })),
+	includeLog: Type.Optional(Type.Boolean({ description: "Include git log --oneline" })),
+	logLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Log entries if includeLog (default 10)" })),
+});
+export type SmartDiffInput = Static<typeof smartDiffParams>;
+
+const smartScanParams = Type.Object({
+	paths: Type.Array(Type.String({ description: "Directories to scan" }), { minItems: 1, maxItems: 8, description: "Up to 8 dirs per call" }),
+	depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5, description: "Depth 1-5 (default 1)" })),
+	withStat: Type.Optional(Type.Boolean({ description: "Include size/mtime (default true)" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max entries per dir (default 50)" })),
+	includeRead: Type.Optional(Type.Boolean({ description: "Auto read top files" })),
+	readLimit: Type.Optional(Type.Integer({ minimum: 10, maximum: 200, description: "Lines per file when includeRead" })),
+});
+export type SmartScanInput = Static<typeof smartScanParams>;
+
 const smartBundleParams = Type.Object({
 	reads: Type.Optional(Type.Array(smartReadFileEntry, { maxItems: 8, description: "Files to read — batch 8" })),
 	greps: Type.Optional(Type.Array(Type.Object({
@@ -553,6 +613,21 @@ const smartBundleParams = Type.Object({
 		path: Type.Optional(Type.String()),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
 	}), { maxItems: 8, description: "Globs — parallel (replaces glob)" })),
+	diffs: Type.Optional(Type.Array(Type.Object({
+		staged: Type.Optional(Type.Boolean()),
+		stat: Type.Optional(Type.Boolean()),
+		base: Type.Optional(Type.String()),
+		maxBytes: Type.Optional(Type.Integer({ minimum: 1000, maximum: 100000 })),
+		includeStatus: Type.Optional(Type.Boolean()),
+		includeLog: Type.Optional(Type.Boolean()),
+		logLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+	}), { maxItems: 4, description: "Diffs — git diff/status/log" })),
+	scans: Type.Optional(Type.Array(Type.Object({
+		path: Type.String({ description: "Dir to scan" }),
+		depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
+		withStat: Type.Optional(Type.Boolean()),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+	}), { maxItems: 8, description: "Scans — ls/stat/tree" })),
 	edits: Type.Optional(Type.Array(Type.Object({
 		path: Type.String({ description: "File to edit" }),
 		edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1, maxItems: 8 }),
@@ -745,6 +820,68 @@ async function doGlobOne(pattern: string, cwd: string, basePath: string | undefi
 	touchGlobCacheEvict();
 	return { files: files.slice(0, limit), cached: false };
 }
+
+async function doDiffOne(opts: any, cwd: string) {
+	const key = normalizeDiffKey(opts);
+	const cached = diffCache.get(key);
+	if (cached && Date.now() - cached.at < DIFFCACHE_TTL) { state.diffCacheHits += 1; return { ...cached, cached: true }; }
+	let diff: string = ""; let status: string = ""; let log: string = ""; let files: any[] = []; let stat: string = "";
+	try {
+		const base = opts.base ?? "HEAD";
+		const args = opts.staged ? ["diff", "--cached"] : ["diff", base];
+		if (opts.stat) args.push("--stat");
+		const { stdout: diffOut } = await execFile("git", args, { cwd, timeout: 8000, maxBuffer: 500000 } as any).catch(()=>({stdout:""} as any));
+		diff = String(diffOut).slice(0, opts.maxBytes ?? 20000);
+		if (opts.stat) stat = diff;
+		else {
+			try { const { stdout: nameOut } = await execFile("git", ["diff", "--name-only", base], { cwd, timeout: 5000 } as any).catch(()=>({stdout:""} as any)); files = String(nameOut).split(String.fromCharCode(10)).filter(Boolean); } catch {}
+		}
+	} catch {}
+	if (opts.includeStatus !== false) {
+		try { const { stdout: statusOut } = await execFile("git", ["status", "--porcelain"], { cwd, timeout: 5000 } as any).catch(()=>({stdout:""} as any)); status = String(statusOut).slice(0, 8000); if (!files.length) files = status.split(String.fromCharCode(10)).filter(Boolean).map(l=> l.slice(3).trim()).filter(Boolean); } catch {}
+	}
+	if (opts.includeLog) {
+		try { const { stdout: logOut } = await execFile("git", ["log", "--oneline", "-" + String(opts.logLimit ?? 10)], { cwd, timeout: 5000 } as any).catch(()=>({stdout:""} as any)); log = String(logOut).slice(0, 8000); } catch {}
+	}
+	const entry = { diff, status, log, files, stat, at: Date.now(), key };
+	diffCache.set(key, entry); touchDiffCacheEvict();
+	return { ...entry, cached: false };
+}
+
+async function doScanOne(dir: any, cwd: string, depth: any, limit: any, withStat: any) {
+	const key = normalizeScanKey([dir], depth);
+	const cached = scanCache.get(key);
+	if (cached && Date.now() - cached.at < SCANCACHE_TTL) { state.scanCacheHits += 1; return { entries: cached.entries.slice(0, limit), cached: true }; }
+	const target = resolveInsideCwd(cwd, dir || ".");
+	let entries: any[] = [];
+	try {
+		const walk = async (cur: any, curDepth: any) => {
+			if (curDepth > (depth ?? 1)) return;
+			let dirents;
+			try { const { readdir } = await import("node:fs/promises"); dirents = await readdir(cur, { withFileTypes: true }); } catch { return; }
+			for (const d of dirents) {
+				if (d.name === ".git" || d.name === "node_modules") continue;
+				const full = join(cur, d.name);
+				let rel;
+				try { const cwdAbs = resolve(cwd); rel = full.startsWith(cwdAbs + sep) ? full.slice(cwdAbs.length+1).split(sep).join('/') : d.name; } catch { rel = d.name; }
+				if (withStat !== false) {
+					try { const st = await stat(full); entries.push({ path: rel, size: st.size, mtime: st.mtimeMs, isDir: d.isDirectory() }); } catch { entries.push({ path: rel, size: 0, mtime: 0, isDir: d.isDirectory() }); }
+				} else {
+					entries.push({ path: rel, size: 0, mtime: 0, isDir: d.isDirectory() });
+				}
+				if (entries.length >= (limit ?? 50)) return;
+				if (d.isDirectory() && curDepth < (depth ?? 1)) await walk(full, curDepth+1);
+				if (entries.length >= (limit ?? 50)) return;
+			}
+		};
+		await walk(target, 1);
+	} catch {}
+	if (withStat !== false) entries.sort((a,b)=> b.mtime - a.mtime);
+	const sliced = entries.slice(0, limit ?? 50);
+	scanCache.set(key, { entries: sliced.slice(), at: Date.now(), key }); touchScanCacheEvict();
+	return { entries: sliced, cached: false };
+}
+
 // ---------------------------------------------------------------------------
 // Main extension
 // ---------------------------------------------------------------------------
@@ -1014,7 +1151,7 @@ ${m.oldText.slice(0,400)}`)); }
 						return;
 					}
 					try { const prevForUndo = existing; const existedForUndo = existing !== null; stashUndo(w.path, prevForUndo, w.content, existedForUndo, "smart_write"); await mkdir(dirname(target), { recursive: true }); await writeFile(target, w.content, "utf8"); } catch (e:any) { const cls = classifyFsError(e, w.path); throw new Error(failBlock("smart_write", cls.why, cls.retry)); }
-					readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); globCache.clear();
+					readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear(); globCache.clear();
 					results.push({ path: w.path, bytes: w.content.length });
 				});
 			}));
@@ -1234,7 +1371,82 @@ ${m.oldText.slice(0,400)}`)); }
 		renderResult(result, _opts, theme) { const d = result.details as any; return new Text(`${theme.fg("success","⟲")} ${theme.fg("accent", d?.path ?? `${d?.undone ?? 0} file(s)`)} ${theme.fg("dim", "reverted")}`, 0, 0); }
 	});
 	// ---- smart_patch
-	const smartPatchTool = defineTool({
+		// ---- smart_diff — git diff/status/log cached 10s (v3.2)
+	const smartDiffTool = defineTool({
+		name: "smart_diff",
+		label: "Smart Diff ⭐ PREFERRED",
+		description: "⭐ PREFERRED GIT DIFF — ALWAYS USE INSTEAD OF `bash` with git diff/status/log. Cached 10s, staged/stat/base, single call returns diff+status+log. Use for EVERY git diff/status/log. Replaces `bash` git.",
+		promptSnippet: "ALWAYS use smart_diff instead of bash git diff — cached 10s",
+		promptGuidelines: [
+			"ALWAYS use smart_diff INSTEAD OF bash git diff/status/log — cached 10s, staged/stat/base. Model MUST prefer this for ANY git diff. DO NOT use `bash` git diff — uncached, no structured output.",
+			"Use includeStatus:false to skip status, includeLog:true for log, stat:true for --stat.",
+		],
+		parameters: smartDiffParams,
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			onUpdate?.({ message: "smart_diff: " + (params.staged?"staged":"" ) + (params.stat?" stat":"") } as any);
+			const res = await doDiffOne(params, ctx.cwd);
+			state.smartDiffs += 1;
+			if (res.cached) state.diffCacheHits += 1;
+			scheduleTelemetry(piRef, "smart-tools:smart_diff", { staged: !!params.staged, stat: !!params.stat, cached: res.cached, files: res.files.length, at: Date.now() });
+			syncSmartUI(ctx);
+			const parts = [];
+			parts.push(`smart_diff base:${params.base??"HEAD"} staged:${!!params.staged} stat:${!!params.stat} files:${res.files.length}${res.cached?" (cached)":""}`);
+			if (res.files.length) parts.push(`--- files (${res.files.length}) ---\n` + res.files.slice(0,20).map(f=>`  ${f}`).join("\n") + (res.files.length>20?`\n  ... +${res.files.length-20} more`:""));
+			if (res.status) parts.push(`--- status ---\n${res.status.slice(0,4000)}`);
+			if (res.diff) parts.push(`--- diff ---\n${res.diff.slice(0,16000)}`);
+			if (res.stat) parts.push(`--- stat ---\n${res.stat.slice(0,4000)}`);
+			if (res.log) parts.push(`--- log ---\n${res.log.slice(0,4000)}`);
+			const combined = parts.join("\n");
+			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+			const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}]` : trunc.content;
+			return { content: [{ type: "text", text }], details: { files: res.files, cached: res.cached, status: res.status.slice(0,500), diff: res.diff.slice(0,500) } };
+		},
+		renderCall(args, theme) { let t = theme.fg("toolTitle", theme.bold("smart_diff")); if ((args as any).staged) t+= theme.fg("dim"," staged"); if ((args as any).stat) t+= theme.fg("dim"," stat"); return new Text(t,0,0); },
+		renderResult(result, opts, theme) { const d=result.details as any; let t=`${theme.fg("success","✓")} ${theme.fg("accent", `${d?.files?.length??0} files`)}${d?.cached?theme.fg("success"," ↻cached"):""}`; if(!opts.expanded) t+=` ${theme.fg("dim",`(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t,0,0); },
+	});
+
+	// ---- smart_scan — ls/stat/tree batch 8 (v3.2)
+	const smartScanTool = defineTool({
+		name: "smart_scan",
+		label: "Smart Scan ⭐ PREFERRED",
+		description: "⭐ PREFERRED SCAN — ALWAYS USE INSTEAD OF `bash` with ls/tree/stat. Batch up to 8 dirs, depth 1-5, mtime-sorted, stat, optional includeRead. Use for EVERY directory listing / tree / stat. Replaces `bash` ls.",
+		promptSnippet: "ALWAYS use smart_scan instead of bash ls — batch 8, mtime-sorted",
+		promptGuidelines: [
+			"ALWAYS use smart_scan INSTEAD OF bash ls/tree/stat — batch 8, mtime-sorted, depth. Model MUST prefer this for ANY listing. DO NOT use `bash` ls — noisy, needs parsing.",
+			"Use includeRead:true to fuse scan+read.",
+		],
+		parameters: smartScanParams,
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			onUpdate?.({ message: `smart_scan: ${params.paths.slice(0,2).join(", ")}` } as any);
+			const limit = Math.min(100, Math.max(1, params.limit ?? 50));
+			const depth = Math.min(5, Math.max(1, params.depth ?? 1));
+			const results = [];
+			for (let i=0;i<params.paths.length;i++) { const pth = params.paths[i]; onUpdate?.({ message: `smart_scan ${i+1}/${params.paths.length}: ${pth}` } as any); const r = await doScanOne(pth, ctx.cwd, depth, limit, params.withStat); results.push({ path: pth, entries: r.entries, cached: r.cached }); }
+			state.smartScans += 1;
+			if (params.paths.length>1) { state.callsSaved += (params.paths.length-1); state.tokensSavedEst += 300*params.paths.length; }
+			const totalEntries = results.reduce((s,r)=> s+r.entries.length,0);
+			scheduleTelemetry(piRef, "smart-tools:smart_scan", { paths: params.paths, totalEntries, at: Date.now(), cached: results.some(r=>r.cached) });
+			syncSmartUI(ctx);
+			let reads: any[] = [];
+			if (params.includeRead) {
+				const uniqFiles = [...new Set(results.flatMap(r=> r.entries.filter((e:any)=> !e.isDir).map((e:any)=> e.path)))].slice(0,3);
+				onUpdate?.({ message: `smart_scan reading ${uniqFiles.length} file(s)` } as any);
+				reads = await Promise.all(uniqFiles.map(async (f)=> {
+					const abs = resolveInsideCwd(ctx.cwd, f);
+					try { const content = await readFile(abs, "utf8"); const lines = content.split(String.fromCharCode(10)); const slice = lines.slice(0, params.readLimit ?? 60).join(String.fromCharCode(10)); const trunc = truncateTail(slice, { maxLines: params.readLimit ?? 60, maxBytes: 8000 }); return `## ${f} [${lines.length} lines]\n${trunc.content}${trunc.truncated?"\n[capped]":""}`; } catch (e:any) { return `## ${f}: ${(e as Error).message.slice(0,200)}`; }
+				}));
+			}
+			const scanText = results.map(r=> `${r.path} (${r.entries.length} entries${r.cached?" cached":""}):\n` + r.entries.slice(0,20).map((e:any)=> `  ${e.isDir?"d":"-"} ${e.path} ${e.isDir?"":`${formatSize(e.size)}`} ${e.mtime?new Date(e.mtime).toLocaleTimeString():""}`).join("\n") + (r.entries.length>20?`\n  ... +${r.entries.length-20} more`:"")).join("\n");
+			const combined = [`smart_scan ${params.paths.length} path(s) total ${totalEntries} entries`, "--- scans ---", scanText, ...(reads.length?["--- reads ---", ...reads]:[])].join("\n");
+			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+			const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)}]` : trunc.content;
+			return { content: [{ type: "text", text }], details: { paths: params.paths, results, totalEntries, reads: reads.length } };
+		},
+		renderCall(args, theme) { let t = theme.fg("toolTitle", theme.bold("smart_scan ")) + theme.fg("muted", `${(args.paths as string[]).slice(0,2).join(", ")}`); if ((args.paths as string[]).length>2) t+= theme.fg("dim", ` +${(args.paths as string[]).length-2} more`); return new Text(t,0,0); },
+		renderResult(result, opts, theme) { const d=result.details as any; let t=`${theme.fg("success","✓")} ${theme.fg("accent", `${d?.totalEntries??0} entries`)}${d?.results?.some((r:any)=>r.cached)?theme.fg("success"," ↻cached"):""}`; if(!opts.expanded) t+=` ${theme.fg("dim",`(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t,0,0); },
+	});
+
+const smartPatchTool = defineTool({
 		name: "smart_patch",
 		label: "Smart Patch ⭐ PREFERRED",
 		description: "⭐ PREFERRED PATCHER — ALWAYS USE INSTEAD OF `bash` with git apply/patch. Atomic unified diff via `git apply --check`, path-traversal guard, auto-fallback to smart_edit anchors. Use for EVERY diff/patch/apply. Replaces `bash` git apply.",
@@ -1337,18 +1549,20 @@ ${m.oldText.slice(0,400)}`)); }
 		parameters: smartBundleParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const hasReads = params.reads && params.reads.length>0;
+			const hasDiffs = (params as any).diffs && (params as any).diffs.length>0;
+			const hasScans = (params as any).scans && (params as any).scans.length>0;
 			const hasGreps = params.greps && params.greps.length>0;
 			const hasGlobs = (params as any).globs && (params as any).globs.length>0;
 			const hasEdits = params.edits && params.edits.length>0;
 			const hasWrites = params.writes && params.writes.length>0;
-			if (!hasReads && !hasGreps && !hasGlobs && !hasEdits && !hasWrites) throw new Error(failBlock("smart_bundle", "at least one of reads/greps/globs/edits/writes required", "Provide at least one operation: e.g. smart_bundle {reads:[{path:\"src/app.ts\"}]} or {edits:[{path:\"a.ts\", edits:[{oldText:\"x\", newText:\"y\"}]}]}"));
+			if (!hasReads && !hasGreps && !hasGlobs && !hasDiffs && !hasScans && !hasEdits && !hasWrites) throw new Error(failBlock("smart_bundle", "at least one of reads/greps/globs/diffs/scans/edits/writes required", "Provide at least one operation: e.g. smart_bundle {reads:[{path:\"src/app.ts\"}]} or {edits:[{path:\"a.ts\", edits:[{oldText:\"x\", newText:\"y\"}]}]}"));
 			if (params.reads && params.reads.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `reads max ${BUNDLE_MAX} exceeded (${(params.reads as any).length})`, `Reduce reads to <=${BUNDLE_MAX} per call. Split into multiple smart_bundle calls.`));
 			if (params.edits && params.edits.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `edits max ${BUNDLE_MAX} files exceeded`, `Reduce edits to <=${BUNDLE_MAX} files per call. Split large refactor into multiple calls.`));
 			if ((params as any).globs && (params as any).globs.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `globs max ${BUNDLE_MAX} exceeded (${(params as any).globs.length})`, `Reduce globs to <=${BUNDLE_MAX} per call.`));
 			if (params.writes && params.writes.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `writes max ${BUNDLE_MAX} exceeded`, `Reduce writes to <=${BUNDLE_MAX} per call.`));
 			const sections: string[] = [];
 			const bundleDetails: any = {};
-			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + ((params as any).globs?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
+			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + ((params as any).globs?.length??0) + ((params as any).diffs?.length??0) + ((params as any).scans?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
 			if (hasGreps) {
 				onUpdate?.({ message: `smart_bundle: ${params.greps!.length} grep(s)` } as any);
 				const grepResults = await Promise.all(params.greps!.map(async (g: any)=>{
@@ -1371,6 +1585,24 @@ ${m.oldText.slice(0,400)}`)); }
 			bundleDetails.globs = globResults.map((r:any)=> ({ pattern:r.pattern, count:r.files.length, cached:r.cached }));
 			sections.push(`--- bundle globs (${globResults.length}) ---`);
 			for (const r of globResults) { sections.push(`${r.pattern}: ${r.files.length} files${r.cached?" (cached)":""}`); if (r.files.length) sections.push(r.files.slice(0,5).map((f:string)=> `  ${f}`).join("\n")); }
+		}
+			if (hasDiffs) {
+			onUpdate?.({ message: `smart_bundle: ${(params as any).diffs!.length} diff(s)` } as any);
+			const diffResults = [];
+			for (const d of (params as any).diffs as any[]) { const r = await doDiffOne(d, ctx.cwd); diffResults.push(r); }
+			state.smartDiffs += diffResults.length;
+			bundleDetails.diffs = diffResults.map((r)=> ({ files: r.files.length, cached: r.cached }));
+			sections.push(`--- bundle diffs (${diffResults.length}) ---`);
+			for (const r of diffResults) sections.push(`files:${r.files.length} ` + r.files.slice(0,3).join(", ") + (r.cached?" (cached)":""));
+		}
+			if (hasScans) {
+			onUpdate?.({ message: `smart_bundle: ${(params as any).scans!.length} scan(s)` } as any);
+			const scanResults = [];
+			for (const sc of (params as any).scans as any[]) { const r = await doScanOne(sc.path, ctx.cwd, sc.depth, sc.limit, sc.withStat); scanResults.push({ path: sc.path, entries: r.entries, cached: r.cached }); }
+			state.smartScans += scanResults.length;
+			bundleDetails.scans = scanResults.map((r)=> ({ path: r.path, count: r.entries.length, cached: r.cached }));
+			sections.push(`--- bundle scans (${scanResults.length}) ---`);
+			for (const r of scanResults) sections.push(`${r.path}: ${r.entries.length} entries` + (r.cached?" (cached)":""));
 		}
 			if (hasReads) {
 				onUpdate?.({ message: `smart_bundle: ${params.reads!.length} read(s)` } as any);
@@ -1414,7 +1646,7 @@ ${m.oldText.slice(0,400)}`)); }
 								if (next === cur) { editResults.push({ path: ef.path, applied: 0, bytes: cur.length, dedup: dedupSkipped, noOp:true }); state.dedupSkipped += dedupSkipped || 1; return; }
 								stashUndo(ef.path, cur, next, true, "smart_bundle");
 								await mkdir(dirname(target), { recursive: true }); await writeFile(target, next, "utf8");
-								readCache.delete(ef.path); readCache.delete(target); grepCache.clear(); globCache.clear();
+								readCache.delete(ef.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
 								editResults.push({ path: ef.path, applied: applied.length, bytes: next.length, dedup: dedupSkipped, suggestion: lowConfidence.length? lowConfidence.map((l:any)=>({i:l.index,c:l.hit!.confidence,s:l.hit!.strategy})):undefined });
 								if (dedupSkipped) state.dedupSkipped += dedupSkipped;
 							});
@@ -1441,7 +1673,7 @@ ${m.oldText.slice(0,400)}`)); }
 						if (existing !== null && hashContent(existing)===hashContent(w.content)) { results.push({path:w.path, bytes:w.content.length, skipped:true}); state.dedupSkipped+=1; return; }
 						stashUndo(w.path, existing, w.content, existing !== null, "smart_bundle");
 						await mkdir(dirname(target),{recursive:true}); await writeFile(target,w.content,"utf8");
-						readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear();
+						readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
 						results.push({path:w.path, bytes:w.content.length});
 					});
 				}));
@@ -1453,7 +1685,7 @@ ${m.oldText.slice(0,400)}`)); }
 			}
 			if (totalOps > 1) { state.callsSaved += (totalOps - 1); state.tokensSavedEst += estimateTokens(totalOps*400); }
 			state.smartBundles += 1;
-			scheduleTelemetry(piRef, "smart-tools:smart_bundle", { reads: params.reads?.length??0, greps: params.greps?.length??0, globs: (params as any).globs?.length??0, edits: params.edits?.length??0, writes: params.writes?.length??0, at: Date.now() });
+			scheduleTelemetry(piRef, "smart-tools:smart_bundle", { reads: params.reads?.length??0, greps: params.greps?.length??0, globs: (params as any).globs?.length??0, diffs: (params as any).diffs?.length??0, scans: (params as any).scans?.length??0, edits: params.edits?.length??0, writes: params.writes?.length??0, at: Date.now() });
 			syncSmartUI(ctx);
 			const combined = sections.join("\n");
 			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
@@ -1465,6 +1697,8 @@ ${m.oldText.slice(0,400)}`)); }
 			if ((args as any).reads?.length) parts.push(`${(args as any).reads.length} reads`);
 			if ((args as any).greps?.length) parts.push(`${(args as any).greps.length} greps`);
 			if ((args as any).globs?.length) parts.push(`${(args as any).globs.length} globs`);
+			if ((args as any).diffs?.length) parts.push(`${(args as any).diffs.length} diffs`);
+			if ((args as any).scans?.length) parts.push(`${(args as any).scans.length} scans`);
 			if ((args as any).edits?.length) parts.push(`${(args as any).edits.length} edits`);
 			if ((args as any).writes?.length) parts.push(`${(args as any).writes.length} writes`);
 			if ((args as any).dryRun) parts.push("dryRun");
@@ -1477,6 +1711,8 @@ ${m.oldText.slice(0,400)}`)); }
 			if (!opts.expanded) { t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t,0,0); }
 			if (d?.greps) t += `\n ${theme.fg("dim","greps:")} ${theme.fg("muted", JSON.stringify(d.greps).slice(0,300))}`;
 			if (d?.globs) t += `\n ${theme.fg("dim","globs:")} ${theme.fg("muted", JSON.stringify(d.globs).slice(0,300))}`;
+			if (d?.diffs) t += `\n ${theme.fg("dim","diffs:")} ${theme.fg("muted", JSON.stringify(d.diffs).slice(0,300))}`;
+			if (d?.scans) t += `\n ${theme.fg("dim","scans:")} ${theme.fg("muted", JSON.stringify(d.scans).slice(0,300))}`;
 			if (d?.reads) t += `\n ${theme.fg("dim","reads:")} ${theme.fg("muted", `${d.reads.count} files cached ${d.reads.cacheHits}`)}`;
 			if (d?.edits) t += `\n ${theme.fg("dim","edits:")} ${theme.fg("muted", JSON.stringify(d.edits).slice(0,300))}`;
 			if (d?.writes) t += `\n ${theme.fg("dim","writes:")} ${theme.fg("muted", JSON.stringify(d.writes).slice(0,300))}`;
@@ -1549,6 +1785,8 @@ ${m.oldText.slice(0,400)}`)); }
 	pi.registerTool(smartReadTool);
 	pi.registerTool(smartWriteTool);
 	pi.registerTool(smartGrepTool);
+	pi.registerTool(smartDiffTool);
+	pi.registerTool(smartScanTool);
 	pi.registerTool(smartGlobTool);
 	pi.registerTool(smartUndoTool);
 	pi.registerTool(smartPatchTool);
@@ -1620,6 +1858,8 @@ ${m.oldText.slice(0,400)}`)); }
 		if (!isError) return undefined;
 		if (content.includes("Why failed:") && content.includes("Retry:")) return undefined;
 		const retryMap: Record<string,string> = {
+			smart_diff: 'Retry: smart_diff {staged:false, stat:true} — check base ref exists, ensure inside git repo, reduce maxBytes if truncated.',
+			smart_scan: 'Retry: smart_scan {paths:["src"] , depth:1} — check path inside cwd, depth 1-5, limit 1-100.',
 			smart_glob: 'Retry: smart_glob {patterns:["src/**/*.ts"]} — check glob syntax (*, **, ?), base path inside cwd, reduce limit if too many matches.',
 			smart_undo: 'Retry: smart_undo {path:"file.ts"} or {lastBundle:true} — ensure file was modified via smart_edit/write/bundle and undo history not empty (32 ops).',
 			smart_read: 'Retry: smart_read {files:["<path>"]} — verify path, use offset/limit, encoding:"base64" for binary.',
@@ -1646,9 +1886,9 @@ ${m.oldText.slice(0,400)}`)); }
 			const lines = [
 				`smart-tools status — ${describeSmart()} v3.0 (bundle flagship)`,
 				`  bundle: ${state.smartBundles}  edits: ${state.smartEdits}  reads: ${state.smartReads} (hits:${state.cacheHits} miss:${state.cacheMisses} grepCache:${state.grepCacheHits})  writes:${state.smartWrites} (dedup:${state.dedupSkipped})`,
-				`  grep:${state.smartGreps} glob:${state.smartGlobs}  patch:${state.smartPatches} undo:${state.smartUndos}  searches:${state.searches}`,
+				`  grep:${state.smartGreps} glob:${state.smartGlobs} diff:${state.smartDiffs} scan:${state.smartScans} patch:${state.smartPatches} undo:${state.smartUndos}  searches:${state.searches}`,
 				`  saved: ${state.callsSaved} calls ~${estimateTokens(state.tokensSavedEst*4)} tokens  bash injected:${state.bashInjected} timeouts:${state.timeoutsDetected}`,
-				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | undo ${undoHistory.length}/${UNDO_MAX}`,
+				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | diffCache ${diffCache.size}/${DIFFCACHE_MAX} TTL 10s | scanCache ${scanCache.size}/${SCANCACHE_MAX} TTL 30s | undo ${undoHistory.length}/${UNDO_MAX}`,
 				`  widget: /smart-history for recent ops`,
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -1729,7 +1969,7 @@ ${m.oldText.slice(0,400)}`)); }
 		if (state.callsSaved || state.cacheHits || state.smartEdits || state.smartReads || state.smartBundles) {
 			try { (ctx as any)?.ui?.notify?.(`smart-tools v3.0 session: saved ~${state.callsSaved} calls · ${state.cacheHits} cache hits (${state.grepCacheHits} grep) · ${state.dedupSkipped} dedup · ${state.smartBundles} bundles`, "info"); } catch {}
 		}
-		readCache.clear(); grepCache.clear(); globCache.clear();
-		state.bashInjected = 0; state.smartEdits = 0; state.smartReads = 0; state.smartWrites = 0; state.smartGreps = 0; state.smartGlobs = 0; state.smartPatches = 0; state.smartBundles = 0; state.smartUndos = 0; state.searches = 0; state.callsSaved = 0; state.cacheHits = 0; state.cacheMisses = 0; state.tokensSavedEst = 0; state.dedupSkipped = 0; state.timeoutsDetected = 0; state.grepCacheHits = 0; state.globCacheHits = 0; pendingTelemetry = [];
+		readCache.clear(); grepCache.clear(); globCache.clear(); diffCache.clear(); scanCache.clear();
+		state.bashInjected = 0; state.smartEdits = 0; state.smartReads = 0; state.smartWrites = 0; state.smartGreps = 0; state.smartGlobs = 0; state.smartDiffs = 0; state.smartScans = 0; state.smartPatches = 0; state.smartBundles = 0; state.smartUndos = 0; state.searches = 0; state.callsSaved = 0; state.cacheHits = 0; state.cacheMisses = 0; state.tokensSavedEst = 0; state.dedupSkipped = 0; state.timeoutsDetected = 0; state.grepCacheHits = 0; state.globCacheHits = 0; pendingTelemetry = [];
 	});
 }
