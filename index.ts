@@ -129,7 +129,7 @@ const CHECKCACHE_MAX = 20;
 const UNDO_MAX = 32;
 const BUNDLE_MAX = 12;
 const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_diff", "smart_scan", "smart_exec", "smart_symbol", "smart_check", "smart_patch", "smart_bundle", "smart_undo", "smart_think", "smart_plan", "smart_recall", "smart_remember", "smart_brain_status"]);
-const SEARCHABLE_TOOL_NAMES = new Set([...SMART_TOOL_CATALOG].filter(n => !["smart_read", "smart_write", "smart_edit", "smart_bundle", "smart_undo"].includes(n)));
+const SEARCHABLE_TOOL_NAMES = new Set([...SMART_TOOL_CATALOG].filter(n => !["smart_read", "smart_write", "smart_edit", "smart_bundle", "smart_undo", "smart_think", "smart_plan", "smart_recall", "smart_remember", "smart_brain_status"].includes(n)));
 const SMART_TOOL_META: Record<string, string> = {
 	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
 	smart_write: "⭐ PREFERRED replaces write — batch 8, dedup, queue-safe",
