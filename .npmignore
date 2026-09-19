@@ -4,7 +4,6 @@ npm-debug.log*
 .DS_Store
 .env
 .env.*
-pi-brain-memory.json
 .git
 .gitignore
 tests
