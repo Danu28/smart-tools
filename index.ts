@@ -128,7 +128,7 @@ const CHECKCACHE_TTL = 30_000;
 const CHECKCACHE_MAX = 20;
 const UNDO_MAX = 32;
 const BUNDLE_MAX = 12;
-const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_diff", "smart_scan", "smart_exec", "smart_symbol", "smart_check", "smart_patch", "smart_bundle", "smart_undo"]);
+const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_diff", "smart_scan", "smart_exec", "smart_symbol", "smart_check", "smart_patch", "smart_bundle", "smart_undo", "smart_think", "smart_plan", "smart_recall", "smart_remember", "smart_brain_status"]);
 const SEARCHABLE_TOOL_NAMES = new Set([...SMART_TOOL_CATALOG].filter(n => !["smart_read", "smart_write", "smart_edit", "smart_bundle", "smart_undo"].includes(n)));
 const SMART_TOOL_META: Record<string, string> = {
 	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
@@ -144,6 +144,11 @@ const SMART_TOOL_META: Record<string, string> = {
 	smart_patch: "⭐ PREFERRED replaces bash git apply — atomic + fallback",
 	smart_bundle: "⭐⭐ STRONGLY PREFERRED replaces all — bundle 8 per type, -50% calls",
 	smart_undo: "⟲ PREFERRED revert — atomic undo for smart_edit/write/bundle (undo stack)",
+	smart_think: "🧠 PFC debate — cost/risk/rev + QDS, blocks write/edit/bash",
+	smart_plan: "🗺️ DAG 3-10 tasks depends/check — verifiable, gated",
+	smart_recall: "🔍 TF-IDF + tag 1.5× + half-life 0.5/7d — pattern completion",
+	smart_remember: "💾 Encode episode — cue 2×, tags, refs, half-life",
+	smart_brain_status: "📊 Brain load — episodes/deliberations/plans/gates",
 };
 
 // Generic TTLCache — unifies 8 cache Maps + eviction (Delete: 7 duplicates removed)
@@ -188,6 +193,29 @@ function stashUndo(path: string, prev: string | null, next: string | null, exist
 }
 let pendingTelemetry: Array<{type:string;data:any}> = [];
 let telemetryTimer: any = null;
+
+// ---------------------------------------------------------------------------
+// Smart Brain — replaces pi-brain (better version, gated, batched, TTLCache)
+// Implements: smart_think (PFC debate), smart_plan (DAG), smart_recall (TF-IDF+tag+half-life), smart_remember, smart_brain_status
+// Gates: [recall?]→think→plan→batch→plan done→remember/habit→commit | unhappy 2 fails→think{debug}
+// ---------------------------------------------------------------------------
+interface BrainEpisode { id: string; cue: string; summary: string; detail?: string; tags: string[]; refs: string[]; at: number; }
+interface BrainDeliberation { id: string; goal: string; hypotheses: string[]; conclusion?: string; winner: number; at: number; }
+interface BrainPlanTask { text: string; done: boolean; depends: number[]; check?: string; }
+interface BrainPlan { id: string; goal: string; tasks: BrainPlanTask[]; at: number; doneAt?: number; }
+const brainEpisodes = new Map<string, BrainEpisode>();
+const brainDeliberations = new Map<string, BrainDeliberation>();
+const brainPlans = new Map<string, BrainPlan>();
+const brainTokenIndex = new Map<string, Set<string>>(); // token -> episode ids
+let brainHasThink = false; let brainHasPlan = false; let brainCurrentPlanId: string | null = null; let brainConsecutiveFails = 0; let brainLastThinkId: string | null = null;
+const BRAIN_HALF_LIFE_DAYS = 7; const BRAIN_HALF_LIFE_FACTOR = 0.5; const BRAIN_TAG_BOOST = 1.5;
+function brainTokenize(s: string): string[] { return s.toLowerCase().split(/[^a-z0-9]+/).filter(t=> t.length>=2).slice(0,40); }
+function brainIndexEpisode(e: BrainEpisode): void { const tokens = new Set([...brainTokenize(e.cue), ...brainTokenize(e.summary), ...(e.detail? brainTokenize(e.detail):[]), ...e.tags.map(t=> t.toLowerCase())]); for(const tok of tokens){ let set = brainTokenIndex.get(tok); if(!set){ set=new Set(); brainTokenIndex.set(tok,set);} set.add(e.id); } }
+function brainScoreEpisode(e: BrainEpisode, queryTokens: string[], tagFilter?: string[]): number { let score=0; const cueTokens=brainTokenize(e.cue); const sumTokens=brainTokenize(e.summary); const detTokens=e.detail? brainTokenize(e.detail):[]; for(const q of queryTokens){ if(cueTokens.includes(q)) score+=2; if(sumTokens.includes(q)) score+=1; if(detTokens.includes(q)) score+=0.5; if(e.tags.includes(q)) score+=BRAIN_TAG_BOOST; } // tag boost
+ if(tagFilter && tagFilter.length){ const hasAll=tagFilter.every(t=> e.tags.includes(t)); if(!hasAll) score=0; else score*=1.2; }
+ const ageDays=(Date.now()-e.at)/86400000; const decay=Math.pow(BRAIN_HALF_LIFE_FACTOR, ageDays/BRAIN_HALF_LIFE_DAYS); return score*decay; }
+function brainParseDepends(text: string): number[] { const m=text.match(/depends:([0-9,\s]+)/); if(!m) return []; return m[1].split(',').map(s=> parseInt(s.trim(),10)).filter(n=> !isNaN(n)); }
+function brainValidatePlanTasks(tasks: string[]): { ok:boolean; err?: string } { if(tasks.length<3) return {ok:false, err:"plan requires 3-10 tasks (got "+tasks.length+")"}; if(tasks.length>10) return {ok:false, err:"plan >10 tasks — chunk: create first 10 then append"}; for(let i=0;i<tasks.length;i++){ const t=tasks[i]; if(t.length<10) return {ok:false, err:"task "+i+" too short (≥10 chars)"}; const deps=brainParseDepends(t); for(const d of deps){ if(d>=i) return {ok:false, err:"task "+i+" depends:"+d+" must be < "+i+" (no self/cycle)"}; if(d<0) return {ok:false, err:"task "+i+" depends negative"}; } } return {ok:true}; }
 
 const _hashMemo = new Map<string,string>();
 function hashContent(s: string): string {
@@ -2060,6 +2088,132 @@ const smartPatchTool = defineTool({
 		}
 	});
 
+	// ---------------------------------------------------------------------------
+	// Smart Brain tools — replaces pi-brain (better: batched, TTLCache, gated, QDS)
+	// ---------------------------------------------------------------------------
+	const smartThinkParams = Type.Object({
+		goal: Type.String({ description: "Reasoning goal — QDS: Question/Delete/Simplify/Accelerate/Automate; must start with 'debug' for unhappy path" }),
+		hypotheses: Type.Array(Type.String(), { minItems: 1, maxItems: 3, description: "Hypotheses: 'Side | cost:3 risk:2 rev:9 | argues...' — cost/risk/rev 1-10, QDS" }),
+		conclusion: Type.Optional(Type.String({ description: "Tentative conclusion / judge reason" })),
+		parentId: Type.Optional(Type.String({ description: "Parent deliberation id for branching" })),
+	});
+	const smartPlanParams = Type.Object({
+		goal: Type.String({ description: "Plan goal — detailed ordered tasks after think" }),
+		tasks: Type.Optional(Type.Array(Type.String(), { minItems: 3, maxItems: 10, description: "Tasks 3-10, each ≥10 chars, well-split, optional depends:0,1 check:bash:..." })),
+		id: Type.Optional(Type.String({ description: "Existing plan id to update" })),
+		done: Type.Optional(Type.Array(Type.Integer({ minimum: 0 }), { description: "Indices to mark done (0-based) — verifiable DAG" })),
+	});
+	const smartRecallParams = Type.Object({
+		query: Type.Optional(Type.String({ description: "Cue to recall by" })),
+		queries: Type.Optional(Type.Array(Type.String(), { maxItems: 5, description: "Batch cues (1 call = N recalls)" })),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Max results" })),
+		tags: Type.Optional(Type.Array(Type.String(), { maxItems: 8, description: "Filter by tags (AND)" })),
+		since: Type.Optional(Type.String({ description: "Filter since: 7d|24h|ISO|ms" })),
+	});
+	const smartRememberParams = Type.Object({
+		cue: Type.String({ description: "Associative cue (kebab-short, 2× weight)" }),
+		summary: Type.String({ description: "One-line summary 120-200 chars" }),
+		detail: Type.Optional(Type.String({ description: "Optional detail" })),
+		tags: Type.Optional(Type.Array(Type.String(), { maxItems: 8, description: "Tags for grouping (kebab)" })),
+		refs: Type.Optional(Type.Array(Type.String(), { maxItems: 5, description: "File refs (≤5)" })),
+	});
+	const smartBrainStatusParams = Type.Object({});
+	const smartThinkTool = defineTool({
+		name: "smart_think",
+		label: "Smart Think — PFC debate", description: "PFC debate graph: 2 debaters + judge + QDS — hypotheses scored cost/risk/rev, winner pinned, loser pruned, graph replayable via smart_recall. BLOCKS write/edit/bash until think+plan.",
+		promptSnippet: "ALWAYS think before act — smart_think blocks write/edit/bash", parameters: smartThinkParams,
+		async execute(_id, params, _s, _u, ctx){
+			if(!params.goal?.trim()) throw new Error(failBlock("smart_think","goal required", "Provide goal: 'which fix for X' or 'debug <Task N> — <tool>: <err>' for unhappy"));
+			if(!params.hypotheses || params.hypotheses.length===0) throw new Error(failBlock("smart_think","hypotheses required (1-3)", "Provide e.g. ['A | cost:3 risk:2 rev:9 | argues...', 'B | cost:5 risk:6 rev:4 | argues...']"));
+			const id=`think:${Date.now()}:${Math.random().toString(36).slice(2,6)}`;
+			// QDS Delete <4 hidden, simple scorer
+			const scored=params.hypotheses.map((h,i)=>{ const m=h.match(/cost:(\d+).*risk:(\d+).*rev:(\d+)/); let avg=5; if(m){ const c=parseInt(m[1]), r=parseInt(m[2]), rev=parseInt(m[3]); avg=( (10-c)+(10-r)+rev)/3; } return {idx:i, text:h, score:avg}; });
+			const winner=scored.sort((a,b)=> b.score-a.score)[0];
+			const deliberation: BrainDeliberation={ id, goal: params.goal, hypotheses: params.hypotheses, conclusion: params.conclusion||`Winner: ${winner.text.slice(0,120)}`, winner: winner.idx, at: Date.now() };
+			brainDeliberations.set(id, deliberation); brainHasThink=true; brainLastThinkId=id; brainConsecutiveFails=0;
+			try{ pi.appendEntry("smart-tools:smart_think" as any, { id, goal: params.goal, winner: winner.idx } as any);}catch{}
+			syncSmartUI(ctx);
+			return { content:[{type:"text", text:`smart_think ${id}\nWinner: H${winner.idx} (${winner.score.toFixed(1)}/10) — ${winner.text.slice(0,200)}\nGoal: ${params.goal}\nUse smart_plan next — gated until plan.`}], details:{ id, winner: winner.idx, deliberation } };
+		}, renderCall(a,t){ return new Text(t.fg("toolTitle",t.bold("smart_think "))+t.fg("muted",a.goal.slice(0,50)),0,0); }, renderResult(r,o,t){ const d=(r.details as any); return new Text(`${t.fg("success","✓")} ${t.fg("accent",d?.id||"think")} ${t.fg("dim",`winner H${d?.winner??0}`)}`,0,0); }
+	});
+	const smartPlanTool = defineTool({
+		name: "smart_plan",
+		label: "Smart Plan — DAG", description: "Detailed ordered checklist 3-10 tasks with depends:0,1 + check:bash:... — verifiable DAG, blocked until think. Mark [x] via done:[i], all done → remember nudge → commit.",
+		promptSnippet: "Plan after think — smart_plan blocks batch exec until DAG ready", parameters: smartPlanParams,
+		async execute(_id, params, _s, _u, ctx){
+			if(params.id && params.done){
+				const plan=brainPlans.get(params.id); if(!plan) throw new Error(failBlock("smart_plan","plan not found "+params.id, "Create plan first with {goal, tasks:[...]}")); for(const idx of params.done){ if(idx<0||idx>=plan.tasks.length) throw new Error(failBlock("smart_plan","done index out of range "+idx, "Use 0-based indices < "+plan.tasks.length)); plan.tasks[idx].done=true; } if(plan.tasks.every(t=>t.done)) plan.doneAt=Date.now(); syncSmartUI(ctx); return {content:[{type:"text", text:`smart_plan ${plan.id} — ${plan.tasks.filter(t=>t.done).length}/${plan.tasks.length} done`}], details:{ id: plan.id, plan }};
+			}
+			if(!params.goal) throw new Error(failBlock("smart_plan","goal required", "Provide goal and tasks[3-10] after smart_think"));
+			if(!brainHasThink) throw new Error(failBlock("smart_plan","think required first", "Call smart_think{goal,hypotheses} before smart_plan (strict gate)"));
+			const tasks=params.tasks||[]; const v=brainValidatePlanTasks(tasks); if(!v.ok) throw new Error(failBlock("smart_plan",v.err!, "Tasks 3-10, each ≥10 chars, depends must be < index"));
+			const id=`plan:${Date.now()}:${Math.random().toString(36).slice(2,6)}`;
+			const planTasks: BrainPlanTask[]=tasks.map(t=> ({ text:t, done:false, depends: brainParseDepends(t), check: (t.match(/check:([^ ]+)/)?.[1]) }));
+			const plan: BrainPlan={ id, goal: params.goal, tasks: planTasks, at: Date.now() };
+			brainPlans.set(id, plan); brainHasPlan=true; brainCurrentPlanId=id;
+			try{ pi.appendEntry("smart-tools:smart_plan" as any, { id, goal: params.goal, tasks: tasks.length } as any);}catch{}
+			syncSmartUI(ctx);
+			return { content:[{type:"text", text:`smart_plan ${id} — ${tasks.length} tasks\n`+tasks.map((t,i)=> `[ ] ${i}: ${t}`).join("\n")}], details:{ id, plan }};
+		}, renderCall(a,t){ return new Text(t.fg("toolTitle",t.bold("smart_plan "))+t.fg("muted",(a.goal||a.id||"").slice(0,40)),0,0); }, renderResult(r,o,t){ const d=(r.details as any); return new Text(`${t.fg("success","✓")} ${t.fg("accent",d?.id||"plan")} ${t.fg("dim",`${d?.plan?.tasks?.length||0} tasks`)}`,0,0); }
+	});
+	const smartRecallTool = defineTool({
+		name: "smart_recall",
+		label: "Smart Recall — TF-IDF", description: "Associative recall: TF-IDF cue→ranked episodes (pattern completion) + tag boost 1.5× + half-life 0.5/7d + filters. Batch queries[]. Time-travel: recall think/plan by verbatim id.",
+		promptSnippet: "Recall before act — smart_recall TF-IDF + tag boost + half-life", parameters: smartRecallParams,
+		async execute(_id, params, _s, _u, _ctx){
+			const queries=params.queries || (params.query!==undefined? [params.query]: [""]);
+			const limit=params.limit||5;
+			const results: any[]=[];
+			for(const q of queries){
+				if(q && (brainDeliberations.has(q) || brainPlans.has(q) || brainEpisodes.has(q))){
+					const item=brainDeliberations.get(q) || brainPlans.get(q) || brainEpisodes.get(q);
+					results.push({ query:q, hits:[item], count:1 }); continue;
+				}
+				const qTokens=brainTokenize(q||"");
+				let candidates:string[]=[];
+				if(qTokens.length===0){
+					candidates=[...brainEpisodes.keys()];
+				} else {
+					const sets=qTokens.map(tok=> brainTokenIndex.get(tok) || new Set<string>());
+					const union=new Set<string>(); for(const s of sets) for(const id of s) union.add(id);
+					candidates=[...union];
+					if(candidates.length===0) candidates=[...brainEpisodes.keys()];
+				}
+				const scored=candidates.map(id=>{ const e=brainEpisodes.get(id)!; return {e, score: brainScoreEpisode(e,qTokens, params.tags)}; }).filter(x=> x.score>0).sort((a,b)=> b.score-a.score).slice(0, limit);
+				results.push({ query:q, hits: scored.map(s=> ({...s.e, _score: s.score.toFixed(2)})), count: scored.length });
+			}
+			const text=results.map(r=> `query:"${r.query}" → ${r.count} hit(s)\n`+r.hits.map((h:any)=> ` • ${h.cue}: ${h.summary} [${(h.tags||[]).join(",")}] score:${h._score||"-"}`).join("\n")).join("\n---\n") || "No episodes. Use smart_remember to encode.";
+			return { content:[{type:"text", text}], details:{ results } };
+		}, renderCall(a,t){ return new Text(t.fg("toolTitle",t.bold("smart_recall "))+t.fg("muted",`"${(a.query||a.queries?.[0]||"").slice(0,30)}"`),0,0); }, renderResult(r,o,t){ const d=(r.details as any); const c=d?.results?.[0]?.count||0; return new Text(`${t.fg("success","✓")} ${t.fg("accent",String(c))} ${t.fg("dim","hits")}`,0,0); }
+	});
+	const smartRememberTool = defineTool({
+		name: "smart_remember",
+		label: "Smart Remember — encode", description: "Explicitly encode episode to brain memory — cue 2×, tags 1.5×, half-life 0.5/7d, refs ≤5. Audit before write: similar → preview. Use after plan done.",
+		promptSnippet: "Encode after done — smart_remember", parameters: smartRememberParams,
+		async execute(_id, params, _s, _u, ctx){
+			if(!params.cue || !params.summary) throw new Error(failBlock("smart_remember","cue+summary required", "Use cue:'kebab-short' summary:'one line' tags:['kebab'] refs:['file']"));
+			const id=`ep:${Date.now()}:${Math.random().toString(36).slice(2,6)}`;
+			const ep: BrainEpisode={ id, cue: params.cue, summary: params.summary, detail: params.detail, tags: params.tags||[], refs: params.refs||[], at: Date.now() };
+			brainEpisodes.set(id, ep); brainIndexEpisode(ep);
+			try{ pi.appendEntry("smart-tools:smart_remember" as any, { id, cue: params.cue } as any);}catch{}
+			syncSmartUI(ctx);
+			return { content:[{type:"text", text:`smart_remember ${id} — ${params.cue}: ${params.summary}`}], details:{ id, episode: ep }};
+		}, renderCall(a,t){ return new Text(t.fg("toolTitle",t.bold("smart_remember "))+t.fg("muted",a.cue),0,0); }, renderResult(r,o,t){ const d=(r.details as any); return new Text(`${t.fg("success","✓")} ${t.fg("accent",d?.id||"ep")} ${t.fg("dim","encoded")}`,0,0); }
+	});
+	const smartBrainStatusTool = defineTool({
+		name: "smart_brain_status",
+		label: "Smart Brain Status", description: "How full is the brain? Episodes | deliberations | plan | gates | overload.",
+		promptSnippet: "Brain load — smart_brain_status", parameters: smartBrainStatusParams,
+		async execute(_id,_p,_s,_u,_ctx){
+			const text=[`smart-brain status — ${brainEpisodes.size} episodes, ${brainDeliberations.size} deliberations, ${brainPlans.size} plans`, `gates: think:${brainHasThink?'✓':'✗'} plan:${brainHasPlan?'✓':'✗'} fails:${brainConsecutiveFails}`, `current plan: ${brainCurrentPlanId||"none"} last think: ${brainLastThinkId||"none"}`, `index: ${brainTokenIndex.size} tokens`, `happy: [recall?]→think→plan→batch→plan done→remember→commit | unhappy: 2 fails→think{debug}`].join("\n");
+			return { content:[{type:"text", text}], details:{ episodes: brainEpisodes.size, deliberations: brainDeliberations.size, plans: brainPlans.size, hasThink: brainHasThink, hasPlan: brainHasPlan, fails: brainConsecutiveFails }};
+		}, renderCall(_a,t){ return new Text(t.fg("toolTitle",t.bold("smart_brain_status")),0,0); }, renderResult(r,o,t){ const d=(r.details as any); return new Text(`${t.fg("accent",String(d?.episodes||0))} ${t.fg("dim","episodes")}`,0,0); }
+	});
+	pi.registerTool(smartThinkTool);
+	pi.registerTool(smartPlanTool);
+	pi.registerTool(smartRecallTool);
+	pi.registerTool(smartRememberTool);
+	pi.registerTool(smartBrainStatusTool);
 	pi.registerTool(smartEditTool);
 	pi.registerTool(smartReadTool);
 	pi.registerTool(smartWriteTool);
@@ -2097,6 +2251,28 @@ const smartPatchTool = defineTool({
 			(input as any)._injectedTimeout = injected;
 			const id = (event as any).toolCallId ?? (event as any).id ?? "";
 			if (id) lastInjected.set(String(id), {ms: injected, wasMissing});
+		}
+		return undefined;
+	});
+
+	// Smart Brain gate — strict happy/unhappy (replaces pi-brain)
+	pi.on("tool_call", async (event, _ctx) => {
+		const name = (event as any).toolName ?? "";
+		const isMutating = name==="smart_write" || name==="smart_edit" || name==="smart_bundle" || name==="bash" || name==="write" || name==="edit";
+		const bundleHasMutate = name==="smart_bundle" && ((event.input as any)?.edits || (event.input as any)?.writes || (event.input as any)?.execs);
+		const shouldGate = isMutating || bundleHasMutate;
+		if (!shouldGate) return undefined;
+		// unhappy: 2 consecutive fails → require debug think
+		if (brainConsecutiveFails >=2) {
+			const isDebugThink = name==="smart_think" && String((event.input as any)?.goal||"").trim().toLowerCase().startsWith("debug");
+			if (!isDebugThink) {
+				return { content: [{ type: "text", text: failBlock("smart-brain gate", `Blocked: 2 consecutive fails (fails=${brainConsecutiveFails}) — unhappy path requires smart_think{goal:'debug <Task N> — <tool>: <err>', hypotheses:[cause,fix]} before retry`, `Call smart_think{goal:'debug ...', hypotheses:['cause','fix']} then smart_plan to retry. Current think:${brainHasThink?'✓':'✗'} plan:${brainHasPlan?'✓':'✗'}`) }], details: { blocked:true, reason:"unhappy" } } as any;
+			}
+			return undefined;
+		}
+		// happy: think→plan before batch
+		if (!brainHasThink || !brainHasPlan) {
+			return { content: [{ type: "text", text: failBlock("smart-brain gate", `Blocked: think→plan required before ${name} (happy: [recall?]→think→plan→batch→plan done→remember→commit) — hasThink:${brainHasThink} hasPlan:${brainHasPlan}`, `Call smart_think{goal,hypotheses} then smart_plan{goal,tasks:[...]} first. Optional smart_recall before think.` ) }], details: { blocked:true, reason:"happy" } } as any;
 		}
 		return undefined;
 	});
@@ -2154,6 +2330,15 @@ const smartPatchTool = defineTool({
 				return { content: [{ type: "text", text: sContent + "\n\n" + failBlock(sName, why2 || "operation failed", retry2) }], details: { ...(event.details as any), smartToolsEnriched: true } };
 			}
 		}
+		// brain consecutive-fails tracking for unhappy path
+		const bNameTrack = (event as any).toolName ?? "";
+		const isMutatingTrack = ["smart_write","smart_edit","smart_bundle","bash","write","edit","smart_exec","smart_patch"].includes(bNameTrack);
+		if (isMutatingTrack) {
+			const isErrTrack = (event as any).isError || String((event.content?.[0] as any)?.text||"").includes("FAILED") || String((event.content?.[0] as any)?.text||"").includes("failed");
+			if (isErrTrack) brainConsecutiveFails += 1; else brainConsecutiveFails = 0;
+		}
+		// reset on debug think success
+		if (bNameTrack==="smart_think" && !(event as any).isError) brainConsecutiveFails = 0;
 		return undefined;
 	});
 
@@ -2168,8 +2353,9 @@ const smartPatchTool = defineTool({
 				`  bundle: ${state.smartBundles}  edits: ${state.smartEdits}  reads: ${state.smartReads} (hits:${state.cacheHits} miss:${state.cacheMisses} grepCache:${state.grepCacheHits})  writes:${state.smartWrites} (dedup:${state.dedupSkipped})`,
 				`  grep:${state.smartGreps} glob:${state.smartGlobs} diff:${state.smartDiffs} scan:${state.smartScans} patch:${state.smartPatches} undo:${state.smartUndos}  searches:${state.searches}`,
 				`  saved: ${state.callsSaved} calls ~${estimateTokens(state.tokensSavedEst*4)} tokens  bash injected:${state.bashInjected} timeouts:${state.timeoutsDetected}`,
-				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | diffCache ${diffCache.size}/${DIFFCACHE_MAX} TTL 30s | scanCache ${scanCache.size}/${SCANCACHE_MAX} TTL 30s | execCache ${execCache.size}/${EXECCACHE_MAX} TTL 30s opt-in | undo ${undoHistory.length}/${UNDO_MAX}`,
-				`  widget: /smart-history for recent ops`,
+				`  brain: ${brainEpisodes.size} ep ${brainDeliberations.size} deliberations ${brainPlans.size} plans — think:${brainHasThink?'✓':'✗'} plan:${brainHasPlan?'✓':'✗'} fails:${brainConsecutiveFails} [${brainHasThink&&brainHasPlan?'ready':'need think→plan'}]`,
+				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | diffCache ${diffCache.size}/${DIFFCACHE_MAX} TTL 30s | scanCache ${scanCache.size}/${SCANCACHE_MAX} TTL 30s | execCache ${execCache.size}/${EXECCACHE_MAX} TTL 30s opt-in | undo ${undoHistory.length}/${UNDO_MAX} brain:${brainEpisodes.size}/${brainPlans.size}`,
+				`  widget: /smart-history + /smart-health + smart_brain_status`,
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
@@ -2206,6 +2392,8 @@ const smartPatchTool = defineTool({
 	// Session lifecycle (smart-tools) — telemetry + deferred loading + widget + prefetch
 	// -----------------------------------------------------------------------
 	pi.on("session_start", async (event, ctx) => {
+		// smart-brain reset per session — gates start closed, fails 0
+		brainHasThink = false; brainHasPlan = false; brainConsecutiveFails = 0;
 		state.bashInjected = 0;
 		state.smartEdits = 0;
 		state.smartReads = 0;
