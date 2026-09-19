@@ -1,5 +1,5 @@
 /**
- * smart-tools v3.0 — batching + fuzzy edits + productivity suite
+ * smart-tools v3.1 — batching + fuzzy edits + productivity suite
  *
  * Gaps solved:
  *  1. edit/read/write N:1 batching + whitespace -> smart_edit/smart_read/smart_write (8 per 1 LLM call, fuzzy, queue-safe)
@@ -13,6 +13,7 @@
  *  9. invisible cost           -> LRU read cache (32/5min slice-aware) + grep intent cache + single telemetry flush + prefetch
  *  10. cryptic UX              -> rich status widget + /smart-status + /smart-history + streaming
  *
+ * v3.1: + smart_glob (glob 8:1 + intent cache + includeRead) + smart_undo (atomic revert) + smart_edit replaceAll
  * v3.0: smart_bundle heterogeneous 1-call (grep+read+edit+write), slice-aware cache, auto-merge, rescue, adaptive budget
  * Goal: 3.8 → 1.9 calls/task (-50%) without quality drop.
  */
@@ -51,8 +52,10 @@ interface SmartState {
 	smartReads: number;
 	smartWrites: number;
 	smartGreps: number;
+	smartGlobs: number;
 	smartPatches: number;
 	smartBundles: number;
+	smartUndos: number;
 	searches: number;
 	callsSaved: number;
 	cacheHits: number;
@@ -61,6 +64,7 @@ interface SmartState {
 	dedupSkipped: number;
 	timeoutsDetected: number;
 	grepCacheHits: number;
+	globCacheHits: number;
 }
 const state: SmartState = {
 	bashInjected: 0,
@@ -68,8 +72,10 @@ const state: SmartState = {
 	smartReads: 0,
 	smartWrites: 0,
 	smartGreps: 0,
+	smartGlobs: 0,
 	smartPatches: 0,
 	smartBundles: 0,
+	smartUndos: 0,
 	searches: 0,
 	callsSaved: 0,
 	cacheHits: 0,
@@ -78,6 +84,7 @@ const state: SmartState = {
 	dedupSkipped: 0,
 	timeoutsDetected: 0,
 	grepCacheHits: 0,
+	globCacheHits: 0,
 };
 
 const MAX_OLDTEXT = 50_000;
@@ -85,22 +92,35 @@ const CACHE_MAX = 32;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const GREPCACHE_TTL = 60_000;
 const GREPCACHE_MAX = 50;
+const GLOBCACHE_TTL = 60_000;
+const GLOBCACHE_MAX = 50;
+const UNDO_MAX = 32;
 const BUNDLE_MAX = 8;
-const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch"]);
-const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_patch", "smart_bundle"]);
+const SEARCHABLE_TOOL_NAMES = new Set(["smart_grep", "smart_patch", "smart_glob"]);
+const SMART_TOOL_CATALOG = new Set(["smart_read", "smart_write", "smart_edit", "smart_grep", "smart_glob", "smart_patch", "smart_bundle", "smart_undo"]);
 const SMART_TOOL_META: Record<string, string> = {
 	smart_read: "⭐ PREFERRED replaces read — batch 8, cached, pagination",
 	smart_write: "⭐ PREFERRED replaces write — batch 8, dedup, queue-safe",
 	smart_edit: "⭐ PREFERRED replaces edit — batch 8, fuzzy 0.72, auto-rescue",
 	smart_grep: "⭐ PREFERRED replaces bash grep — rg bridge, cached, includeRead",
+	smart_glob: "⭐ PREFERRED replaces glob — batch 8 patterns, mtime-sorted, cached, includeRead",
 	smart_patch: "⭐ PREFERRED replaces bash git apply — atomic + fallback",
 	smart_bundle: "⭐⭐ STRONGLY PREFERRED replaces all — bundle 8 per type, -50% calls",
+	smart_undo: "⟲ PREFERRED revert — atomic undo for smart_edit/write/bundle (undo stack)",
 };
 
 interface CacheEntry { content: string; mtimeMs: number; hash: string; at: number; size: number; }
 const readCache = new Map<string, CacheEntry>();
 interface GrepCacheEntry { hits: Array<{file:string;line:number;preview:string}>; engine: string; at: number; query:string; }
 const grepCache = new Map<string, GrepCacheEntry>();
+interface GlobCacheEntry { files: string[]; at: number; pattern: string; }
+const globCache = new Map<string, GlobCacheEntry>();
+interface UndoEntry { path: string; prevContent: string | null; nextContent: string | null; existed: boolean; at: number; op: string; }
+const undoHistory: UndoEntry[] = [];
+function stashUndo(path: string, prev: string | null, next: string | null, existed: boolean, op: string) {
+	undoHistory.push({ path, prevContent: prev, nextContent: next, existed, at: Date.now(), op });
+	if (undoHistory.length > UNDO_MAX) undoHistory.shift();
+}
 let pendingTelemetry: Array<{type:string;data:any}> = [];
 let telemetryTimer: any = null;
 
@@ -124,7 +144,7 @@ function renderStatus(theme: any): string {
 	return `${dot}${label}${hint}`;
 }
 function renderWidgetLines(theme: any): string[] {
-	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartPatches===0 && state.smartBundles===0 && state.callsSaved===0;
+	const idle = state.smartEdits===0 && state.smartReads===0 && state.smartWrites===0 && state.smartGreps===0 && state.smartGlobs===0 && state.smartPatches===0 && state.smartBundles===0 && state.smartUndos===0 && state.callsSaved===0;
 	if (idle) {
 		return [ `${theme.fg("dim", "◇")} ${theme.fg("accent","smart-tools")} ${theme.fg("dim","·")} ${theme.fg("muted","batch 8:1 · fuzzy edits · queue-safe · 30s timeout")}` ];
 	}
@@ -134,7 +154,9 @@ function renderWidgetLines(theme: any): string[] {
 	if (state.smartReads) parts.push(`${theme.fg("muted","reads")} ${theme.fg("accent", String(state.smartReads))}${state.cacheHits ? theme.fg("success", ` ↻${state.cacheHits}`) : ""}`);
 	if (state.smartWrites) parts.push(`${theme.fg("muted","writes")} ${theme.fg("accent", String(state.smartWrites))}${state.dedupSkipped ? theme.fg("dim", ` ≡${state.dedupSkipped}`) : ""}`);
 	if (state.smartGreps) parts.push(`${theme.fg("muted","grep")} ${theme.fg("accent", String(state.smartGreps))}${state.grepCacheHits? theme.fg("success", ` ↻${state.grepCacheHits}`):""}`);
+	if (state.smartGlobs) parts.push(`${theme.fg("muted","glob")} ${theme.fg("accent", String(state.smartGlobs))}${state.globCacheHits? theme.fg("success", ` ↻${state.globCacheHits}`):""}`);
 	if (state.smartPatches) parts.push(`${theme.fg("muted","patch")} ${theme.fg("accent", String(state.smartPatches))}`);
+	if (state.smartUndos) parts.push(`${theme.fg("muted","undo")} ${theme.fg("accent", String(state.smartUndos))}`);
 	const line1 = `${theme.fg("accent","◇ smart-tools")}  ${theme.fg("dim","│")}  ${parts.join(theme.fg("dim"," · "))}`;
 	const sub: string[] = [];
 	if (state.callsSaved) sub.push(`${theme.fg("success", String(state.callsSaved))}${theme.fg("dim"," saved")}${state.tokensSavedEst ? theme.fg("dim", ` ~${formatSize(state.tokensSavedEst*4)}`) : ""}`);
@@ -148,7 +170,7 @@ function describeSmart(): string { return `smart-tools · ${state.callsSaved ? s
 function widgetLines(): string[] {
 	const a: string[] = [];
 	a.push(`smart-tools  bundles:${state.smartBundles} edits:${state.smartEdits}  reads:${state.smartReads}${state.cacheHits ? ` (${state.cacheHits} cache hit)` : ""}  writes:${state.smartWrites}${state.dedupSkipped ? ` (${state.dedupSkipped} no-op skip)` : ""}`);
-	if (state.smartGreps || state.smartPatches || state.searches) a.push(`grep:${state.smartGreps} patch:${state.smartPatches} search:${state.searches}`);
+	if (state.smartGreps || state.smartGlobs || state.smartPatches || state.searches || state.smartUndos) a.push(`grep:${state.smartGreps} glob:${state.smartGlobs} patch:${state.smartPatches} undo:${state.smartUndos} search:${state.searches}`);
 	if (state.callsSaved) a.push(`saved ~${state.callsSaved} LLM calls · ~${estimateTokens(state.tokensSavedEst*4)} tokens · bash injected:${state.bashInjected}`);
 	else a.push(`batch 8:1 · fuzzy edits · queue-safe · timeout 30s`);
 	return a;
@@ -188,6 +210,15 @@ function touchGrepCacheEvict(): void {
 	const entries = [...grepCache.entries()].sort((a,b)=>a[1].at - b[1].at);
 	const toDelete = grepCache.size - GREPCACHE_MAX;
 	for (let i=0;i<toDelete;i++) grepCache.delete(entries[i][0]);
+}
+function touchGlobCacheEvict(): void {
+	if (globCache.size <= GLOBCACHE_MAX) return;
+	const entries = [...globCache.entries()].sort((a,b)=>a[1].at - b[1].at);
+	const toDelete = globCache.size - GLOBCACHE_MAX;
+	for (let i=0;i<toDelete;i++) globCache.delete(entries[i][0]);
+}
+function normalizeGlobKey(pattern: string, path?: string): string {
+	return `${pattern.trim()}::${(path??".").trim()}`;
 }
 function normalizeGrepKey(query: string, globs?: string[]): string {
 	const n = query.trim().toLowerCase().replace(/\s+/g," ").slice(0,80);
@@ -445,6 +476,7 @@ const smartEditParams = Type.Object({
 	createIfMissing: Type.Optional(Type.Boolean({ description: "Create file if missing (default true)" })),
 	dryRun: Type.Optional(Type.Boolean({ description: "Validate only — no write, returns validation + preview" })),
 	strict: Type.Optional(Type.Boolean({ description: "Reject fuzzy <0.85 confidence (default false)" })),
+	replaceAll: Type.Optional(Type.Boolean({ description: "Replace all occurrences of each oldText (default false, unique check)" })),
 });
 export type SmartEditInput = Static<typeof smartEditParams>;
 
@@ -493,6 +525,22 @@ const searchSmartToolsParams = Type.Object({
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Max tools to load" })),
 });
 
+const smartGlobParams = Type.Object({
+	patterns: Type.Array(Type.String({ description: "Glob pattern e.g. 'src/**/*.ts'" }), { minItems: 1, maxItems: 8, description: "Up to 8 glob patterns per call — batch" }),
+	path: Type.Optional(Type.String({ description: "Base directory to search in (default cwd)" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max files per pattern (default 30)" })),
+	includeRead: Type.Optional(Type.Boolean({ description: "Auto read top unique files (default false) - fuses glob+read" })),
+	readLimit: Type.Optional(Type.Integer({ minimum: 10, maximum: 200, description: "Lines per file when includeRead (default 60)" })),
+});
+export type SmartGlobInput = Static<typeof smartGlobParams>;
+
+const smartUndoParams = Type.Object({
+	path: Type.Optional(Type.String({ description: "File to undo (default: last modified file)" })),
+	steps: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, description: "Number of undo steps (default 1)" })),
+	lastBundle: Type.Optional(Type.Boolean({ description: "Undo all files from last smart_bundle (default false)" })),
+});
+export type SmartUndoInput = Static<typeof smartUndoParams>;
+
 const smartBundleParams = Type.Object({
 	reads: Type.Optional(Type.Array(smartReadFileEntry, { maxItems: 8, description: "Files to read — batch 8" })),
 	greps: Type.Optional(Type.Array(Type.Object({
@@ -500,6 +548,11 @@ const smartBundleParams = Type.Object({
 		maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
 		globs: Type.Optional(Type.Array(Type.String())),
 	}), { maxItems: 4, description: "Greps — parallel" })),
+	globs: Type.Optional(Type.Array(Type.Object({
+		pattern: Type.String({ description: "Glob pattern" }),
+		path: Type.Optional(Type.String()),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+	}), { maxItems: 8, description: "Globs — parallel (replaces glob)" })),
 	edits: Type.Optional(Type.Array(Type.Object({
 		path: Type.String({ description: "File to edit" }),
 		edits: Type.Array(Type.Object({ oldText: Type.String(), newText: Type.String() }), { minItems: 1, maxItems: 8 }),
@@ -649,6 +702,49 @@ async function doGrepOne(query:string, maxResults:number, globs:string[]|undefin
 	touchGrepCacheEvict();
 	return { hits, engine: used };
 }
+
+async function doGlobOne(pattern: string, cwd: string, basePath: string | undefined, limit: number): Promise<{ files: string[]; cached: boolean }> {
+	const key = normalizeGlobKey(pattern, basePath);
+	const cached = globCache.get(key);
+	if (cached && Date.now() - cached.at < GLOBCACHE_TTL) {
+		state.globCacheHits += 1;
+		return { files: cached.files.slice(0, limit), cached: true };
+	}
+	let root = cwd;
+	if (basePath) { try { root = resolveInsideCwd(cwd, basePath); } catch { root = cwd; } }
+	let files: string[] = [];
+	try {
+		const fsp: any = await import("node:fs/promises");
+		if (typeof fsp.glob === "function") {
+			for await (const entry of fsp.glob(pattern, { cwd: root, withFileTypes: false, exclude: (p: any) => (p as any).name === ".git" || (p as any).name === "node_modules" })) {
+				let rel = typeof entry === "string" ? entry as string : String(entry);
+				try { const abs = resolve(root, rel); const cwdAbs = resolve(cwd); if (abs.startsWith(cwdAbs + sep)) rel = abs.slice(cwdAbs.length + 1); } catch {}
+				files.push(rel.split(sep).join('/'));
+				if (files.length >= limit) break;
+			}
+		} else { throw new Error("no glob"); }
+	} catch {
+		try {
+			const { execFile: ef } = await import("node:child_process");
+			const { promisify: pro } = await import("node:util");
+			const efile: any = pro(ef as any);
+			const { stdout } = await efile("find", [root, "-type", "f", "-not", "-path", "*/.git/*", "-not", "-path", "*/node_modules/*"], { maxBuffer: 2000000, timeout: 8000 } as any).catch(()=>({stdout:""} as any));
+			const all = String(stdout).split("\n").filter(Boolean).map(p=> p.startsWith(root) ? p.slice(root.length+1).replace(/^\/+/,"").split(sep).join('/') : p);
+			const esc = (str:string)=> str.replace(/[.+^\${}()|\[\]\\]/g,"\\$&");
+			const rxStr = "^" + esc(pattern).replace(/\\\*/g,".*").replace(/\*/g,"[^/]*").replace(/\?/g,".") + "$";
+			let rx: RegExp | null = null; try { rx = new RegExp(rxStr); } catch {}
+			if (rx) files = all.filter(f=> rx!.test(f)).slice(0, limit); else files = all.slice(0, limit);
+		} catch {}
+	}
+	try {
+		const withMtime = await Promise.all(files.map(async f=> { try { const st = await stat(resolveInsideCwd(cwd, f)); return { f, m: (st as any).mtimeMs as number }; } catch { return { f, m: 0 }; }}));
+		withMtime.sort((a,b)=> b.m - a.m);
+		files = withMtime.map(x=> x.f);
+	} catch {}
+	globCache.set(key, { files: files.slice(), at: Date.now(), pattern });
+	touchGlobCacheEvict();
+	return { files: files.slice(0, limit), cached: false };
+}
 // ---------------------------------------------------------------------------
 // Main extension
 // ---------------------------------------------------------------------------
@@ -747,8 +843,23 @@ ${m.oldText.slice(0,400)}`)); }
 				}
 				let next: string; let applied: ValidatedEdit[]; let dedupSkipped = 0; let lowConfidence: ValidatedEdit[] = [];
 				try {
+					if (params.replaceAll) {
+						// replaceAll mode: global string replace per edit (exact), bypasses fuzzy/overlap checks
+						let tmp = curInside; let totalApplied = 0; const tmpApplied: ValidatedEdit[] = []; let tmpDedup = 0;
+						for (let i=0;i<params.edits.length;i++) { const e = (params.edits as any[])[i]; if (e.oldText === "") { tmp += (tmp.endsWith("\n") || tmp === "" ? "" : "\n") + e.newText; tmpApplied.push({ index:i, oldText:e.oldText, newText:e.newText, hit:{ idx: tmp.length, confidence:1, strategy:"append", startLine: tmp.split("\n").length, endLine: tmp.split("\n").length, length:0 }, found:true, isAppend:true } as any); totalApplied++; continue; } if (e.oldText === e.newText) { tmpDedup++; continue; } const parts = tmp.split(e.oldText); if (parts.length <=1) { // try fuzzy single occurrence as fallback
+							const hit = findFuzzyDetailed(tmp, e.oldText); if (!hit) throw new Error(failBlock("smart_edit", `oldText not found for replaceAll (edit ${i})`, retryHintForEdit()));
+							// replace fuzzy hit once
+							const before = tmp.slice(0, hit.idx); const after = tmp.slice(hit.idx + hit.length); tmp = before + e.newText + after;
+						} else {
+							tmp = parts.join(e.newText);
+						}
+						tmpApplied.push({ index:i, oldText:e.oldText, newText:e.newText, hit:{ idx:0, confidence:1, strategy:"exact", startLine:0, endLine:0, length:e.oldText.length }, found:true, isAppend:false } as any);
+						}
+						next = tmp; applied = tmpApplied; dedupSkipped = tmpDedup; lowConfidence = [];
+					} else {
 					const res = applyEditsAtomic(curInside, params.edits, { strict: params.strict });
 					next = res.next; applied = res.applied; dedupSkipped = res.dedupSkipped; lowConfidence = res.lowConfidence;
+				}
 				} catch (e) { throw e; }
 				if (next === curInside && existed) {
 					state.dedupSkipped += 1;
@@ -757,6 +868,7 @@ ${m.oldText.slice(0,400)}`)); }
 					syncSmartUI(ctx);
 					return { content: [{ type: "text", text: `smart_edit ${params.path}: no-op (content unchanged) — ${params.edits.length} edit(s) dedupSkipped:${dedupSkipped}` }], details: { path: params.path, applied: 0, noOp: true, dedupSkipped, bytesBefore: curInside.length, bytesAfter: next.length } };
 				}
+				stashUndo(params.path, curInside, next, existed, "smart_edit");
 				await writeFile(target, next, "utf8");
 				readCache.delete(params.path); readCache.delete(target);
 				try { const st3 = await stat(target); readCache.set(params.path, { content: next, mtimeMs: (st3 as any).mtimeMs || Date.now(), hash: hashContent(next), at: Date.now(), size: next.length }); } catch {}
@@ -901,8 +1013,8 @@ ${m.oldText.slice(0,400)}`)); }
 						state.dedupSkipped += 1;
 						return;
 					}
-					try { await mkdir(dirname(target), { recursive: true }); await writeFile(target, w.content, "utf8"); } catch (e:any) { const cls = classifyFsError(e, w.path); throw new Error(failBlock("smart_write", cls.why, cls.retry)); }
-					readCache.delete(w.path); readCache.delete(target); grepCache.clear();
+					try { const prevForUndo = existing; const existedForUndo = existing !== null; stashUndo(w.path, prevForUndo, w.content, existedForUndo, "smart_write"); await mkdir(dirname(target), { recursive: true }); await writeFile(target, w.content, "utf8"); } catch (e:any) { const cls = classifyFsError(e, w.path); throw new Error(failBlock("smart_write", cls.why, cls.retry)); }
+					readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear(); globCache.clear();
 					results.push({ path: w.path, bytes: w.content.length });
 				});
 			}));
@@ -1002,7 +1114,126 @@ ${m.oldText.slice(0,400)}`)); }
 			return new Text(t, 0, 0);
 		},
 	});
-	// ---- smart_patch — git apply bridge + edit fallback (S22)
+	// ---- smart_glob — batch glob + intent cache + optional read (v3.1)
+	const smartGlobTool = defineTool({
+		name: "smart_glob",
+		label: "Smart Glob ⭐ PREFERRED",
+		description: "⭐ PREFERRED GLOB — ALWAYS USE INSTEAD OF `glob` or `bash` with find/ls. Batch up to 8 patterns, mtime-sorted newest first, intent cache 60s, optional includeRead fuses glob+read in 1 call. Use for EVERY file discovery / list / glob. Replaces `glob` completely.",
+		promptSnippet: "ALWAYS use smart_glob instead of glob — batch 8, cached, includeRead",
+		promptGuidelines: [
+			"ALWAYS use smart_glob INSTEAD OF glob / bash find — cached 60s, mtime-sorted, batch 8. Model MUST prefer this for ANY file discovery. DO NOT use `glob` or `bash find` — uncached, no read fusion.",
+			"If you already know the file, use smart_read/smart_bundle directly; glob only to discover.",
+			"Use includeRead:true to fuse glob+read into 1 call — no extra read turn.",
+		],
+		parameters: smartGlobParams,
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			onUpdate?.({ message: `smart_glob: ${params.patterns.slice(0,2).join(", ")}` } as any);
+			const limit = Math.min(100, Math.max(1, params.limit ?? 30));
+			const includeRead = params.includeRead ?? false;
+			const readLimit = Math.min(200, Math.max(10, params.readLimit ?? 60));
+			const results: Array<{pattern:string; files:string[]; cached:boolean}> = [];
+			for (let i=0;i<params.patterns.length;i++) { const pat = params.patterns[i]; onUpdate?.({ message: `smart_glob ${i+1}/${params.patterns.length}: ${pat}` } as any); const r = await doGlobOne(pat, ctx.cwd, params.path, limit); results.push({ pattern: pat, files: r.files, cached: r.cached }); }
+			state.smartGlobs += 1;
+			if (params.patterns.length > 1) { state.callsSaved += (params.patterns.length - 1); state.tokensSavedEst += estimateTokens(params.patterns.length * 300); }
+			if (includeRead && results.some(r=> r.files.length)) state.callsSaved += 1;
+			scheduleTelemetry(piRef, "smart-tools:smart_glob", { patterns: params.patterns, totalFiles: results.reduce((s,r)=> s + r.files.length, 0), at: Date.now(), cached: results.some(r=> r.cached) });
+			syncSmartUI(ctx);
+			let reads: string[] = [];
+			if (includeRead) {
+				const uniqFiles = [...new Set(results.flatMap(r=> r.files))].slice(0, 3);
+				onUpdate?.({ message: `smart_glob reading ${uniqFiles.length} file(s)` } as any);
+				reads = await Promise.all(uniqFiles.map(async (f) => {
+					const abs = resolveInsideCwd(ctx.cwd, f);
+					try {
+						let content: string; let mtimeMs = 0, sz = 0;
+						try { const st = await stat(abs); mtimeMs = (st as any).mtimeMs; sz = (st as any).size; } catch {}
+						const cached = readCache.get(f) ?? readCache.get(abs);
+						if (cached && mtimeMs && isCacheValid(cached, mtimeMs, sz)) { content = cached.content; state.cacheHits++; } else { content = await readFile(abs, "utf8"); readCache.set(f, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); readCache.set(abs, { content, mtimeMs: mtimeMs || Date.now(), hash: hashContent(content), at: Date.now(), size: content.length }); touchCacheEvict(); state.cacheMisses++; }
+						const lines = content.split("\n");
+						const slice = lines.slice(0, readLimit).join("\n");
+						const trunc = truncateTail(slice, { maxLines: readLimit, maxBytes: 8000 });
+						return `## ${f} [${lines.length} lines, first ${readLimit}]\n${trunc.content}${trunc.truncated?"\n[capped]":""}`;
+					} catch (e:any) { return `## ${f}: ${(e as Error).message.slice(0,300)}`; }
+				}));
+			}
+			const patternText = results.map(r=> `${r.pattern} (${r.files.length} files${r.cached?" cached":""}):\n` + (r.files.length? r.files.slice(0, 20).map(f=> `  ${f}`).join("\n") : "  (no matches)") + (r.files.length>20? `\n  ... +${r.files.length-20} more`:"")).join("\n");
+			const combined = [`smart_glob ${params.patterns.length} pattern(s) total ${results.reduce((s,r)=> s+r.files.length,0)} files`, "--- patterns ---", patternText, ...(reads.length? ["--- reads (top 3 files) ---", ...reads] : [])].join("\n");
+			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+			const text = trunc.truncated ? `${trunc.content}\n[truncated ${formatSize(trunc.outputBytes)}/${formatSize(trunc.totalBytes)} — narrow pattern or reduce limit]` : trunc.content;
+			return { content: [{ type: "text", text }], details: { patterns: params.patterns, results, totalFiles: results.reduce((s,r)=> s+r.files.length,0), reads: reads.length } };
+		},
+		renderCall(args, theme) { let t = theme.fg("toolTitle", theme.bold("smart_glob ")) + theme.fg("muted", `${(args.patterns as string[]).slice(0,2).join(", ")}`); if ((args.patterns as string[]).length>2) t += theme.fg("dim", ` +${(args.patterns as string[]).length-2} more`); if ((args as any).includeRead) t += theme.fg("dim", " +read"); return new Text(t, 0, 0); },
+		renderResult(result, opts, theme) {
+			const d = result.details as any;
+			let t = `${theme.fg("success","✓")} ${theme.fg("accent", `${d?.totalFiles ?? 0} files`)} ${theme.fg("dim", `via ${d?.results?.length ?? 0} pattern(s)`)}`;
+			if (d?.reads) t += theme.fg("dim", ` +${d.reads} reads`);
+			if (!opts.expanded) { t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t, 0, 0); }
+			const files = (d?.results ?? []).flatMap((r:any)=> r.files).slice(0,8);
+			if (files.length) t += `\n${files.map((f:string)=>`  ${theme.fg("dim","•")} ${theme.fg("muted", f)}`).join("\n")}`;
+			if ((d?.totalFiles??0)>8) t += `\n ${theme.fg("muted", `... ${d.totalFiles-8} more files`)}`;
+			return new Text(t, 0, 0);
+		},
+	});
+	// ---- smart_undo — atomic revert via undo stack
+	const smartUndoTool = defineTool({
+		name: "smart_undo",
+		label: "Smart Undo ⟲",
+		description: "⟲ ATOMIC UNDO — Reverts last smart_edit / smart_write / smart_bundle change via local undo stack (no git needed). Use when an edit was wrong or to rollback. Supports batch lastBundle revert.",
+		promptSnippet: "Use smart_undo to revert last edit/write/bundle atomically",
+		promptGuidelines: ["Use smart_undo instead of manual re-edit or bash git checkout — atomic, instant, no re-read.", "Prefer smart_undo single file vs lastBundle"],
+		parameters: smartUndoParams,
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+			onUpdate?.({ message: "smart_undo: searching history" } as any);
+			const steps = Math.min(10, Math.max(1, params.steps ?? 1));
+			if (params.lastBundle) {
+				const bundleEntries = [...undoHistory].reverse().filter(e=> e.op.includes("bundle") || e.op === "smart_bundle").slice(0, 8);
+				if (!bundleEntries.length) {
+					const fallback = [...undoHistory].reverse().slice(0, 8);
+					if (!fallback.length) throw new Error(failBlock("smart_undo", "undo history empty — nothing to revert", "Make an edit/write/bundle first, then undo."));
+					// undo last 8 entries as bundle fallback
+					let undone = 0; const msgs: string[] = [];
+					for (const e of fallback) { try { const target = resolveInsideCwd(ctx.cwd, e.path); await withFileMutationQueue(target, async()=> { if (e.existed && e.prevContent !== null) { await mkdir(dirname(target), { recursive:true }); await writeFile(target, e.prevContent!, "utf8"); } else { try { const { unlink } = await import("node:fs/promises"); await unlink(target); } catch {} } readCache.delete(e.path); readCache.delete(target); try { if (e.prevContent !== null) { const st = await stat(target); readCache.set(e.path, { content: e.prevContent!, mtimeMs: (st as any).mtimeMs||Date.now(), hash: hashContent(e.prevContent!), at: Date.now(), size: e.prevContent!.length }); } } catch {}
+					}); undone++; msgs.push(`${e.path} reverted`); } catch (err:any) { msgs.push(`${e.path} failed: ${(err as Error).message.slice(0,120)}`); } }
+					state.smartUndos += 1; scheduleTelemetry(piRef, "smart-tools:smart_undo", { lastBundle:true, undone, at: Date.now() }); syncSmartUI(ctx); return { content: [{ type: "text", text: `smart_undo lastBundle: ${undone} file(s)\n${msgs.join("\n")}` }], details: { undone, msgs, lastBundle:true } };
+				}
+				let undone = 0; const msgs: string[] = [];
+				for (const e of bundleEntries) { try { const target = resolveInsideCwd(ctx.cwd, e.path); await withFileMutationQueue(target, async()=> { if (e.existed && e.prevContent !== null) { await mkdir(dirname(target), { recursive:true }); await writeFile(target, e.prevContent!, "utf8"); } else { try { const { unlink } = await import("node:fs/promises"); await unlink(target); } catch {} } readCache.delete(e.path); readCache.delete(target); }); undone++; msgs.push(`${e.path} reverted`); const idx = undoHistory.indexOf(e); if (idx>=0) undoHistory.splice(idx,1); } catch (err:any) { msgs.push(`${e.path} failed: ${(err as Error).message.slice(0,120)}`); } }
+				state.smartUndos += 1; scheduleTelemetry(piRef, "smart-tools:smart_undo", { lastBundle:true, undone, at: Date.now() }); syncSmartUI(ctx); return { content: [{ type: "text", text: `smart_undo lastBundle: ${undone} file(s)\n${msgs.join("\n")}` }], details: { undone, msgs, lastBundle:true } };
+			}
+			if (params.path) {
+				const targetPath = params.path;
+				const matches = [...undoHistory].reverse().filter(e=> e.path === targetPath);
+				if (!matches.length) throw new Error(failBlock("smart_undo", `no undo history for ${targetPath}`, `Check path is relative to cwd and file was modified via smart_edit/write/bundle. History holds last ${UNDO_MAX} ops.`));
+				const toUndo = matches.slice(0, steps);
+				let lastContent: string | null = null;
+				for (const e of toUndo) {
+					const target = resolveInsideCwd(ctx.cwd, e.path);
+					await withFileMutationQueue(target, async()=> {
+						if (e.existed && e.prevContent !== null) { await mkdir(dirname(target), { recursive:true }); await writeFile(target, e.prevContent!, "utf8"); lastContent = e.prevContent; } else { try { const { unlink } = await import("node:fs/promises"); await unlink(target); lastContent = null; } catch {} }
+						readCache.delete(e.path); readCache.delete(target);
+						if (e.prevContent !== null) { try { const st = await stat(target); readCache.set(e.path, { content: e.prevContent!, mtimeMs: (st as any).mtimeMs||Date.now(), hash: hashContent(e.prevContent!), at: Date.now(), size: e.prevContent!.length }); } catch {} }
+					});
+					const idx = undoHistory.indexOf(e); if (idx>=0) undoHistory.splice(idx,1);
+				}
+				state.smartUndos += 1; scheduleTelemetry(piRef, "smart-tools:smart_undo", { path: targetPath, steps: toUndo.length, at: Date.now() }); syncSmartUI(ctx);
+				return { content: [{ type: "text", text: `smart_undo ${targetPath}: reverted ${toUndo.length} step(s)` }], details: { path: targetPath, undone: toUndo.length, bytes: lastContent ? (lastContent as string).length : 0 } };
+			}
+			// no path: undo last file
+			const last = undoHistory[undoHistory.length-1];
+			if (!last) throw new Error(failBlock("smart_undo", "undo history empty", "Modify a file via smart_edit/write/bundle first."));
+			const target = resolveInsideCwd(ctx.cwd, last.path);
+			await withFileMutationQueue(target, async()=> {
+				if (last.existed && last.prevContent !== null) { await mkdir(dirname(target), { recursive:true }); await writeFile(target, last.prevContent!, "utf8"); } else { try { const { unlink } = await import("node:fs/promises"); await unlink(target); } catch {} }
+				readCache.delete(last.path); readCache.delete(target);
+			});
+			undoHistory.pop();
+			state.smartUndos += 1; scheduleTelemetry(piRef, "smart-tools:smart_undo", { path: last.path, at: Date.now() }); syncSmartUI(ctx);
+			return { content: [{ type: "text", text: `smart_undo ${last.path}: reverted last change` }], details: { path: last.path, undone: 1 } };
+		},
+		renderCall(args, theme) { let t = theme.fg("toolTitle", theme.bold("smart_undo ")) + theme.fg("muted", (args as any).path ?? (args as any).lastBundle ? "lastBundle" : "last"); return new Text(t, 0, 0); },
+		renderResult(result, _opts, theme) { const d = result.details as any; return new Text(`${theme.fg("success","⟲")} ${theme.fg("accent", d?.path ?? `${d?.undone ?? 0} file(s)`)} ${theme.fg("dim", "reverted")}`, 0, 0); }
+	});
+	// ---- smart_patch
 	const smartPatchTool = defineTool({
 		name: "smart_patch",
 		label: "Smart Patch ⭐ PREFERRED",
@@ -1066,7 +1297,7 @@ ${m.oldText.slice(0,400)}`)); }
 				onUpdate?.({ message: "smart_patch: applying" } as any);
 				await execFile("git", ["apply", tmp], { cwd: ctx.cwd, timeout: 15000 } as any);
 				const files = [...patch.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m=>m[1].trim()).slice(0, 20);
-				for (const f of files) { readCache.delete(f); try { readCache.delete(resolve(ctx.cwd, f)); } catch {} }
+				for (const f of files) { readCache.delete(f); try { readCache.delete(resolve(ctx.cwd, f)); } catch {} } globCache.clear();
 				grepCache.clear(); state.smartPatches += 1;
 				if (files.length > 1) { state.callsSaved += (files.length - 1); state.tokensSavedEst += estimateTokens(patch.length/4); }
 				scheduleTelemetry(piRef, "smart-tools:smart_patch", { files, at: Date.now(), bytes: patch.length });
@@ -1107,15 +1338,17 @@ ${m.oldText.slice(0,400)}`)); }
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const hasReads = params.reads && params.reads.length>0;
 			const hasGreps = params.greps && params.greps.length>0;
+			const hasGlobs = (params as any).globs && (params as any).globs.length>0;
 			const hasEdits = params.edits && params.edits.length>0;
 			const hasWrites = params.writes && params.writes.length>0;
-			if (!hasReads && !hasGreps && !hasEdits && !hasWrites) throw new Error(failBlock("smart_bundle", "at least one of reads/greps/edits/writes required", "Provide at least one operation: e.g. smart_bundle {reads:[{path:\"src/app.ts\"}]} or {edits:[{path:\"a.ts\", edits:[{oldText:\"x\", newText:\"y\"}]}]}"));
-			if (params.reads && params.reads.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `reads max ${BUNDLE_MAX} exceeded (${params.reads.length})`, `Reduce reads to <=${BUNDLE_MAX} per call. Split into multiple smart_bundle calls.`));
+			if (!hasReads && !hasGreps && !hasGlobs && !hasEdits && !hasWrites) throw new Error(failBlock("smart_bundle", "at least one of reads/greps/globs/edits/writes required", "Provide at least one operation: e.g. smart_bundle {reads:[{path:\"src/app.ts\"}]} or {edits:[{path:\"a.ts\", edits:[{oldText:\"x\", newText:\"y\"}]}]}"));
+			if (params.reads && params.reads.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `reads max ${BUNDLE_MAX} exceeded (${(params.reads as any).length})`, `Reduce reads to <=${BUNDLE_MAX} per call. Split into multiple smart_bundle calls.`));
 			if (params.edits && params.edits.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `edits max ${BUNDLE_MAX} files exceeded`, `Reduce edits to <=${BUNDLE_MAX} files per call. Split large refactor into multiple calls.`));
+			if ((params as any).globs && (params as any).globs.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `globs max ${BUNDLE_MAX} exceeded (${(params as any).globs.length})`, `Reduce globs to <=${BUNDLE_MAX} per call.`));
 			if (params.writes && params.writes.length> BUNDLE_MAX) throw new Error(failBlock("smart_bundle", `writes max ${BUNDLE_MAX} exceeded`, `Reduce writes to <=${BUNDLE_MAX} per call.`));
 			const sections: string[] = [];
 			const bundleDetails: any = {};
-			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
+			let totalOps = (params.reads?.length??0) + (params.greps?.length??0) + ((params as any).globs?.length??0) + (params.edits?.length??0) + (params.writes?.length??0);
 			if (hasGreps) {
 				onUpdate?.({ message: `smart_bundle: ${params.greps!.length} grep(s)` } as any);
 				const grepResults = await Promise.all(params.greps!.map(async (g: any)=>{
@@ -1127,6 +1360,18 @@ ${m.oldText.slice(0,400)}`)); }
 				sections.push(`--- bundle greps (${grepResults.length}) ---`);
 				for (const r of grepResults) { sections.push(`query "${r.query}" via ${r.engine}: ${r.hits.length} hits`); if (r.hits.length) sections.push(r.hits.slice(0,5).map((h:any)=> `  ${h.file}:${h.line}: ${h.preview.slice(0,120)}`).join("\n")); }
 			}
+			if (hasGlobs) {
+			onUpdate?.({ message: `smart_bundle: ${(params as any).globs!.length} glob(s)` } as any);
+			const globResults: Array<{pattern:string; files:string[]; cached:boolean}> = [];
+			for (const g of (params as any).globs as any[]) {
+				const r = await doGlobOne(g.pattern, ctx.cwd, g.path, Math.min(100, g.limit ?? 30));
+				globResults.push({ pattern: g.pattern, files: r.files, cached: r.cached });
+			}
+			state.smartGlobs += globResults.length;
+			bundleDetails.globs = globResults.map((r:any)=> ({ pattern:r.pattern, count:r.files.length, cached:r.cached }));
+			sections.push(`--- bundle globs (${globResults.length}) ---`);
+			for (const r of globResults) { sections.push(`${r.pattern}: ${r.files.length} files${r.cached?" (cached)":""}`); if (r.files.length) sections.push(r.files.slice(0,5).map((f:string)=> `  ${f}`).join("\n")); }
+		}
 			if (hasReads) {
 				onUpdate?.({ message: `smart_bundle: ${params.reads!.length} read(s)` } as any);
 				const entries = params.reads!.slice(0, BUNDLE_MAX);
@@ -1160,11 +1405,17 @@ ${m.oldText.slice(0,400)}`)); }
 								if (v.missing.length) { try { const fresh = await readFile(target, "utf8"); if (fresh !== cur) { const v2 = validateEdits(fresh, ef.edits); if (v2.missing.length < v.missing.length) { cur = fresh; v = v2; } } } catch {} }
 								if (v.missing.length) throw new Error(failBlock("smart_bundle", `oldText not found in ${ef.path} (edits ${v.missing.map(m=>m.index).join(",")})`, `${retryHintForEdit()} — re-read file and fix anchor.`, `${getNearbyPreview(cur, null, v.missing[0].oldText).slice(0,400)}`));
 								if (v.overlaps.length) throw new Error(failBlock("smart_bundle", `overlapping edits in ${ef.path}: ${v.overlaps.map(([a,b])=>`${a}<->${b}`).join(",")}`, `Merge overlapping edits into one. Each edits[].oldText must be non-overlapping against original.`));
-								const { next, applied, dedupSkipped, lowConfidence } = applyEditsAtomic(cur, ef.edits, { strict: params.strict });
+								let next: string, applied: any, dedupSkipped: number, lowConfidence: any;
+								if ((params as any).replaceAll || (ef as any).replaceAll) {
+								let tmp = cur; const tmpApplied:any[]=[]; let tmpDedup=0;
+								for (const e of ef.edits as any[]) { if (e.oldText==="") { tmp += (tmp.endsWith(String.fromCharCode(10))||tmp===""?"":String.fromCharCode(10))+e.newText; tmpApplied.push({index:0, oldText:e.oldText, newText:e.newText} as any); continue; } if (e.oldText===e.newText){tmpDedup++; continue;} const parts=tmp.split(e.oldText); if(parts.length>1) tmp=parts.join(e.newText); else { const hit=findFuzzyDetailed(tmp,e.oldText); if(!hit) throw new Error(failBlock("smart_bundle", `oldText not found in ${ef.path}`, retryHintForEdit())); const before=tmp.slice(0,hit.idx); const after=tmp.slice(hit.idx+hit.length); tmp=before+e.newText+after; } tmpApplied.push({index:0, oldText:e.oldText,newText:e.newText} as any); }
+								next=tmp; applied=tmpApplied; dedupSkipped=tmpDedup; lowConfidence=[];
+							} else { const res = applyEditsAtomic(cur, ef.edits, { strict: params.strict }); next=res.next; applied=res.applied; dedupSkipped=res.dedupSkipped; lowConfidence=res.lowConfidence; }
 								if (next === cur) { editResults.push({ path: ef.path, applied: 0, bytes: cur.length, dedup: dedupSkipped, noOp:true }); state.dedupSkipped += dedupSkipped || 1; return; }
+								stashUndo(ef.path, cur, next, true, "smart_bundle");
 								await mkdir(dirname(target), { recursive: true }); await writeFile(target, next, "utf8");
-								readCache.delete(ef.path); readCache.delete(target); grepCache.clear();
-								editResults.push({ path: ef.path, applied: applied.length, bytes: next.length, dedup: dedupSkipped, suggestion: lowConfidence.length? lowConfidence.map(l=>({i:l.index,c:l.hit!.confidence,s:l.hit!.strategy})):undefined });
+								readCache.delete(ef.path); readCache.delete(target); grepCache.clear(); globCache.clear();
+								editResults.push({ path: ef.path, applied: applied.length, bytes: next.length, dedup: dedupSkipped, suggestion: lowConfidence.length? lowConfidence.map((l:any)=>({i:l.index,c:l.hit!.confidence,s:l.hit!.strategy})):undefined });
 								if (dedupSkipped) state.dedupSkipped += dedupSkipped;
 							});
 						} catch (e:any) { editFail = e; }
@@ -1188,8 +1439,9 @@ ${m.oldText.slice(0,400)}`)); }
 					return withFileMutationQueue(target, async()=>{
 						let existing: string|null=null; try { existing = await readFile(target,"utf8"); } catch {}
 						if (existing !== null && hashContent(existing)===hashContent(w.content)) { results.push({path:w.path, bytes:w.content.length, skipped:true}); state.dedupSkipped+=1; return; }
+						stashUndo(w.path, existing, w.content, existing !== null, "smart_bundle");
 						await mkdir(dirname(target),{recursive:true}); await writeFile(target,w.content,"utf8");
-						readCache.delete(w.path); readCache.delete(target); grepCache.clear();
+						readCache.delete(w.path); readCache.delete(target); grepCache.clear(); globCache.clear();
 						results.push({path:w.path, bytes:w.content.length});
 					});
 				}));
@@ -1201,7 +1453,7 @@ ${m.oldText.slice(0,400)}`)); }
 			}
 			if (totalOps > 1) { state.callsSaved += (totalOps - 1); state.tokensSavedEst += estimateTokens(totalOps*400); }
 			state.smartBundles += 1;
-			scheduleTelemetry(piRef, "smart-tools:smart_bundle", { reads: params.reads?.length??0, greps: params.greps?.length??0, edits: params.edits?.length??0, writes: params.writes?.length??0, at: Date.now() });
+			scheduleTelemetry(piRef, "smart-tools:smart_bundle", { reads: params.reads?.length??0, greps: params.greps?.length??0, globs: (params as any).globs?.length??0, edits: params.edits?.length??0, writes: params.writes?.length??0, at: Date.now() });
 			syncSmartUI(ctx);
 			const combined = sections.join("\n");
 			const trunc = truncateHead(combined, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
@@ -1212,6 +1464,7 @@ ${m.oldText.slice(0,400)}`)); }
 			const parts: string[] = [];
 			if ((args as any).reads?.length) parts.push(`${(args as any).reads.length} reads`);
 			if ((args as any).greps?.length) parts.push(`${(args as any).greps.length} greps`);
+			if ((args as any).globs?.length) parts.push(`${(args as any).globs.length} globs`);
 			if ((args as any).edits?.length) parts.push(`${(args as any).edits.length} edits`);
 			if ((args as any).writes?.length) parts.push(`${(args as any).writes.length} writes`);
 			if ((args as any).dryRun) parts.push("dryRun");
@@ -1223,6 +1476,7 @@ ${m.oldText.slice(0,400)}`)); }
 			let t = `${theme.fg("success","✓")} ${theme.fg("accent","smart_bundle")} ${theme.fg("dim", `${d?.totalOps??0} ops`)}${d?.saved? theme.fg("success", ` saved ${d.saved}`):""}`;
 			if (!opts.expanded) { t += ` ${theme.fg("dim", `(${keyHint("app.tools.expand","expand")})`)}`; return new Text(t,0,0); }
 			if (d?.greps) t += `\n ${theme.fg("dim","greps:")} ${theme.fg("muted", JSON.stringify(d.greps).slice(0,300))}`;
+			if (d?.globs) t += `\n ${theme.fg("dim","globs:")} ${theme.fg("muted", JSON.stringify(d.globs).slice(0,300))}`;
 			if (d?.reads) t += `\n ${theme.fg("dim","reads:")} ${theme.fg("muted", `${d.reads.count} files cached ${d.reads.cacheHits}`)}`;
 			if (d?.edits) t += `\n ${theme.fg("dim","edits:")} ${theme.fg("muted", JSON.stringify(d.edits).slice(0,300))}`;
 			if (d?.writes) t += `\n ${theme.fg("dim","writes:")} ${theme.fg("muted", JSON.stringify(d.writes).slice(0,300))}`;
@@ -1256,8 +1510,10 @@ ${m.oldText.slice(0,400)}`)); }
 					if (q.includes("write")) scored.push("smart_write");
 					if (q.includes("edit")) scored.push("smart_edit");
 					if (q.includes("grep")||q.includes("search")||q.includes("find")||q.includes("rg")) scored.push("smart_grep");
+				if (q.includes("glob")) scored.push("smart_glob");
 					if (q.includes("patch")||q.includes("diff")||q.includes("apply")) scored.push("smart_patch");
 					if (q.includes("bundle")||q.includes("hetero")||q.includes("multi")||q.includes("batch")) scored.push("smart_bundle");
+				if (q.includes("undo")||q.includes("revert")||q.includes("rollback")) scored.push("smart_undo");
 					if (q.includes("all")||q.includes("list")||q.includes("smart")) scored.push(...SMART_TOOL_CATALOG);
 				}
 			}
@@ -1293,6 +1549,8 @@ ${m.oldText.slice(0,400)}`)); }
 	pi.registerTool(smartReadTool);
 	pi.registerTool(smartWriteTool);
 	pi.registerTool(smartGrepTool);
+	pi.registerTool(smartGlobTool);
+	pi.registerTool(smartUndoTool);
 	pi.registerTool(smartPatchTool);
 	pi.registerTool(searchSmartToolsTool);
 	pi.registerTool(smartBundleTool);
@@ -1362,6 +1620,8 @@ ${m.oldText.slice(0,400)}`)); }
 		if (!isError) return undefined;
 		if (content.includes("Why failed:") && content.includes("Retry:")) return undefined;
 		const retryMap: Record<string,string> = {
+			smart_glob: 'Retry: smart_glob {patterns:["src/**/*.ts"]} — check glob syntax (*, **, ?), base path inside cwd, reduce limit if too many matches.',
+			smart_undo: 'Retry: smart_undo {path:"file.ts"} or {lastBundle:true} — ensure file was modified via smart_edit/write/bundle and undo history not empty (32 ops).',
 			smart_read: 'Retry: smart_read {files:["<path>"]} — verify path, use offset/limit, encoding:"base64" for binary.',
 			smart_write: 'Retry: smart_write {writes:[{path:"<path>", content:"..."}]} — check path relative to cwd, parent dir writable.',
 			smart_edit: 'Retry: ' + "smart_read first, copy exact 3-6 line anchor with unique symbol, then smart_edit with that oldText. Use dryRun:true to validate.",
@@ -1386,9 +1646,9 @@ ${m.oldText.slice(0,400)}`)); }
 			const lines = [
 				`smart-tools status — ${describeSmart()} v3.0 (bundle flagship)`,
 				`  bundle: ${state.smartBundles}  edits: ${state.smartEdits}  reads: ${state.smartReads} (hits:${state.cacheHits} miss:${state.cacheMisses} grepCache:${state.grepCacheHits})  writes:${state.smartWrites} (dedup:${state.dedupSkipped})`,
-				`  grep:${state.smartGreps}  patch:${state.smartPatches}  searches:${state.searches}`,
+				`  grep:${state.smartGreps} glob:${state.smartGlobs}  patch:${state.smartPatches} undo:${state.smartUndos}  searches:${state.searches}`,
 				`  saved: ${state.callsSaved} calls ~${estimateTokens(state.tokensSavedEst*4)} tokens  bash injected:${state.bashInjected} timeouts:${state.timeoutsDetected}`,
-				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s`,
+				`  cache: ${readCache.size}/${CACHE_MAX} entries TTL 5min slice-aware | grepCache ${grepCache.size}/${GREPCACHE_MAX} TTL 60s | globCache ${globCache.size}/${GLOBCACHE_MAX} TTL 60s | undo ${undoHistory.length}/${UNDO_MAX}`,
 				`  widget: /smart-history for recent ops`,
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -1424,6 +1684,8 @@ ${m.oldText.slice(0,400)}`)); }
 				if (entry.customType === "smart-tools:smart_read") state.smartReads += 1;
 				if (entry.customType === "smart-tools:smart_write") state.smartWrites += 1;
 				if (entry.customType === "smart-tools:smart_grep") state.smartGreps += 1;
+				if (entry.customType === "smart-tools:smart_glob") state.smartGlobs += 1;
+				if (entry.customType === "smart-tools:smart_undo") state.smartUndos += 1;
 				if (entry.customType === "smart-tools:smart_patch") state.smartPatches += 1;
 				if (entry.customType === "smart-tools:smart_bundle" || entry.customType === "smart-tools:turn") state.smartBundles += 1;
 				if (entry.customType === "smart-tools:search_smart_tools") state.searches += 1;
@@ -1467,7 +1729,7 @@ ${m.oldText.slice(0,400)}`)); }
 		if (state.callsSaved || state.cacheHits || state.smartEdits || state.smartReads || state.smartBundles) {
 			try { (ctx as any)?.ui?.notify?.(`smart-tools v3.0 session: saved ~${state.callsSaved} calls · ${state.cacheHits} cache hits (${state.grepCacheHits} grep) · ${state.dedupSkipped} dedup · ${state.smartBundles} bundles`, "info"); } catch {}
 		}
-		readCache.clear(); grepCache.clear();
-		state.bashInjected = 0; state.smartEdits = 0; state.smartReads = 0; state.smartWrites = 0; state.smartGreps = 0; state.smartPatches = 0; state.smartBundles = 0; state.searches = 0; state.callsSaved = 0; state.cacheHits = 0; state.cacheMisses = 0; state.tokensSavedEst = 0; state.dedupSkipped = 0; state.timeoutsDetected = 0; state.grepCacheHits = 0; pendingTelemetry = [];
+		readCache.clear(); grepCache.clear(); globCache.clear();
+		state.bashInjected = 0; state.smartEdits = 0; state.smartReads = 0; state.smartWrites = 0; state.smartGreps = 0; state.smartGlobs = 0; state.smartPatches = 0; state.smartBundles = 0; state.smartUndos = 0; state.searches = 0; state.callsSaved = 0; state.cacheHits = 0; state.cacheMisses = 0; state.tokensSavedEst = 0; state.dedupSkipped = 0; state.timeoutsDetected = 0; state.grepCacheHits = 0; state.globCacheHits = 0; pendingTelemetry = [];
 	});
 }
