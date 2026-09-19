@@ -11,4 +11,4 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
-      - run: git diff --exit-code dist/ || (echo "dist drift — run npm run build and commit" && exit 1)
+      - run: test -f dist/index.js || (echo "dist/index.js missing — build failed" && exit 1)

@@ -6,13 +6,13 @@ Batching + fuzzy edits + productivity suite for [pi](https://github.com/badlogic
 
 | Tool | Replaces | What it does |
 |------|----------|--------------|
-| `smart_bundle` | `grep+glob+diff+scan+exec+symbol+check+read+edit+write` | **Flagship v4.0** — heterogeneous batch in ONE LLM call (8 per type, single flush), queue-safe, saves 3 turns |
+| `smart_bundle` | `grep+glob+diff+scan+exec+symbol+check+read+edit+write` | **Flagship v4.0** — heterogeneous batch in ONE LLM call (12 per type, single flush), queue-safe, saves 3 turns |
 | `smart_read` | `read` | Batched 8 files, `offset/limit`, binary guard, adaptive budget, slice-aware LRU cache (32/5min, 60% hit) |
 | `smart_write` | `write` | Batched 8 files, parallel sharded queue, hash dedup (skip no-op) |
 | `smart_edit` | `edit` | Fuzzy line-trim/collapsed 0.72, queue-safe, `dryRun`/`strict`/`replaceAll`, auto-rescue, auto-merge, no-op dedup |
 | `smart_grep` | `bash rg` | rg→grep bridge + intent cache 60s + optional auto-read (1 call vs 2) |
 | `smart_glob` | `glob` / `bash find` | Batch 8 patterns, mtime-sorted, intent cache 60s, optional includeRead |
-| `smart_diff` | `bash git diff/status/log` | Cached 10s, staged/stat/base, returns diff+status+log, files list |
+| `smart_diff` | `bash git diff/status/log` | Cached 30s, staged/stat/base, returns diff+status+log, files list |
 | `smart_scan` | `bash ls/tree/stat` | Batch 8 dirs, depth 1-5, mtime-sorted, stat, optional includeRead |
 | `smart_exec` | `bash` batch | **NEW v4.0** — batch 8 cmds, timeout/cwd, summarize, risk guard (blocks rm -rf /) |
 | `smart_symbol` | `grep` for symbols | **NEW v4.0** — LSP-lite regex for function/class/interface/type/const, 85% accuracy |
@@ -79,11 +79,11 @@ smart_undo({ path:"src/app.ts" })
 - **Delete** grep/glob/scan/symbol when files explicit (prompt lists `src/foo.ts` → read directly)
 - **Delete** read when cache-hot slice-aware (mtime+size+hash, 60% hit)
 - **Delete** retry via auto-rescue + auto-merge
-- **Simplify** to one heterogeneous `smart_bundle` (8 per type, single flush) now with `execs/symbols/checks`
-- **Accelerate** with intent cache (grep/glob 60s, diff 10s, scan 30s, exec 30s, symbol 60s, check 30s), adaptive budget, prefetch
+- **Simplify** to one heterogeneous `smart_bundle` (12 per type, single flush) now with `execs/symbols/checks`
+- **Accelerate** with intent cache (grep/glob 60s, diff 30s, scan 30s, exec 30s opt-in, symbol 60s, check 30s), adaptive budget, prefetch
 - **Automate** fallback `patch→edit` + undo stack + single telemetry flush (300ms)
 
-No new deps, no vector DB. TypeScript strict, queue-safe, 8-per-call.
+No new deps, no vector DB. TypeScript strict, queue-safe, 12-per-call.
 
 ## Transparency
 
@@ -96,13 +96,13 @@ Collapsed = minimal (`✓ smart_bundle 8 ops saved 7`), Expanded (`expand`) = fu
   CACHE_MAX: 32, CACHE_TTL_MS: 300000,     // slice-aware
   GREPCACHE_TTL: 60000, GREPCACHE_MAX: 50,
   GLOBCACHE_TTL: 60000, GLOBCACHE_MAX: 50,
-  DIFFCACHE_TTL: 10000, DIFFCACHE_MAX: 20,
+  DIFFCACHE_TTL: 30000, DIFFCACHE_MAX: 20,
   SCANCACHE_TTL: 30000, SCANCACHE_MAX: 50,
   EXECCACHE_TTL: 30000, EXECCACHE_MAX: 20,
   SYMBOLCACHE_TTL: 60000, SYMBOLCACHE_MAX: 50,
   CHECKCACHE_TTL: 30000, CHECKCACHE_MAX: 20,
   UNDO_MAX: 32,
-  BUNDLE_MAX: 8, BUDGET_BYTES: 51200
+  BUNDLE_MAX: 12, BUDGET_BYTES: 51200
 }
 // Env: SMARTTOOLS_QUIET=1 silences widget nudge
 ```

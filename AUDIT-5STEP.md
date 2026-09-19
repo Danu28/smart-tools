@@ -1,110 +1,107 @@
 # smart-tools 5-Step Audit — Question / Delete / Simplify / Accelerate / Automate
 
-**Date:** 2025-09-19  
-**Repo:** @danu28/smart-tools v4.0.0  
-**Scope:** index.ts (2274 lines, 160KB), dist/index.js (185KB), package.json, README, tsconfig  
+**Date:** 2026-05-13 (re-audit, Think→Plan→Complete)
+**Repo:** @danu28/smart-tools v4.0.0
+**Scope:** index.ts (2463 lines, ~179KB), dist/index.js (207KB), package.json, README, tsconfig, .github/workflows/check.yml
 **Rule:** Never optimize something that shouldn't exist.
+**Prev:** 2025-09-19 audit (2274 lines) — 5 of 6 P0 fixes now DONE.
 
 ## 1. QUESTION — Challenge every requirement
 
-### Inventory
-- **Entry:** single `index.ts` 2274 lines + `dist/index.js` build artifact
-- **Tools:** 13 registered: `smart_read`, `smart_write`, `smart_edit`, `smart_grep`, `smart_glob`, `smart_diff`, `smart_scan`, `smart_exec`, `smart_symbol`, `smart_check`, `smart_patch`, `smart_undo`, `smart_bundle` + `search_smart_tools`
-- **Commands:** `/smart-status`, `/smart-history`
-- **Handlers:** `tool_call` (bash gate), `tool_result` ×2 (timeout + enrichment), `session_start`, `session_shutdown`
+### Inventory (verified 2026-05-13)
+- **Entry:** single `index.ts` 2463 lines + `dist/index.js` build artifact (207KB, .gitignore'd, not tracked ✓)
+- **Tools:** 13 registered: `smart_read`, `smart_write`, `smart_edit`, `smart_grep`, `smart_glob`, `smart_diff`, `smart_scan`, `smart_exec`, `smart_symbol`, `smart_check`, `smart_patch`, `smart_undo`, `smart_bundle` + `search_smart_tools` + `smart_think/plan/recall/remember/brain_status`
+- **Commands:** `/smart-status`, `/smart-history`, `/smart-health` (v4.0)
+- **Handlers:** `tool_call` ×2 (bash gate 2236 + brain gate 2259), `tool_result` ×1 (merged 2280), `session_start` 2394, `session_shutdown` 2451
 - **Deps:** `typebox` only, peer `pi-coding-agent@^0.85.1` — lean ✅
-- **Grep:** TODO/FIXME/HACK 0 hits, unused/deprecated 0 hits, tsc --noEmit passes ✅
-- **Structure:** `src/` empty (0 entries) despite README examples using `src/app.ts` — docs vs reality mismatch
+- **Grep:** TODO/FIXME/HACK 0 hits, `tsc --noEmit` passes ✅
+- **Caches:** 8× `TTLCache<K,V>` generic (unified) — 32/5min read + 50/60s grep/glob/symbol + 20/30s diff/scan/exec/check
 
 ### Requirement Challenges
 | Tool | Question | Verdict |
 |------|----------|---------|
-| `smart_bundle` | Flagship — bundles 8 per type, single flush, saves 3 turns. Core value prop. | **KEEP** |
-| `smart_read/write/edit` | Preferred replacements for read/write/edit. Validated 60% cache hit, dedup. | **KEEP** |
-| `smart_grep/glob/diff/scan` | Each duplicates native `bash` but saves 1 call + caches. Overlap with bundle? | **KEEP but DEFER** via search_smart_tools (already done) |
-| `smart_exec` | Batch bash 8 cmds — new in v4.0, overlaps bash gate. Needed for Turn2 parallel. | **KEEP** |
-| `smart_symbol` | LSP-lite regex 85% — nice but rarely used vs grep. | **QUESTION** — keep deferred, not default active |
-| `smart_check` | Structured tsc wrapper — saves parsing 2000 lines. | **KEEP deferred** |
-| `smart_patch` | git apply + fallback — low frequency, but completes patch gap. | **KEEP deferred** |
-| `smart_undo` | Undo stack 32 — essential for safe edits. | **KEEP** |
-| `search_smart_tools` | Lazy loader — solves prompt bloat. | **KEEP** |
-| `dist/` | Build output 185KB — is it source? package.json `files:["dist"]` + `prepare: build` means dist should be published but NOT committed if .gitignore has `dist/` | **QUESTION** — if tracked, violates source-of-truth |
-| `src/` | Empty dir | **QUESTION** — delete or implement split |
+| `smart_bundle` | Flagship — 12 per type, single flush, saves 3 turns 3.8→1.9 | **KEEP** |
+| `smart_read/write/edit` | Cached 60% hit, dedup, queue-safe, fuzzy 0.72 | **KEEP** |
+| `smart_grep/glob/diff/scan` | Duplicates bash but saves 1 call + caches | **KEEP deferred** via search_smart_tools ✓ |
+| `smart_exec` | Batch 8 cmds, risk guard `rm -rf /` | **KEEP** |
+| `smart_symbol` | LSP-lite 85% — low frequency | **KEEP deferred** ✓ |
+| `smart_check` | Structured tsc wrapper | **KEEP deferred** ✓ |
+| `smart_patch` | git apply + fallback | **KEEP deferred** ✓ |
+| `smart_undo` | Undo stack 32 | **KEEP** |
+| `search_smart_tools` | Solves prompt bloat (60% deferred) | **KEEP** |
+| `smart_think/plan` | PFC debate + DAG, gates mutating tools | **KEEP** — required by 5-Step |
+| `dist/` | `files:["dist"]` + `prepare:build`, .gitignore'd, not tracked | **KEEP untracked** ✓ |
+| `src/` | Empty dir | **DELETE noise** — not tracked |
 
 ## 2. DELETE — Never optimize what shouldn't exist
 
-### Must Delete (no optimization needed)
-1. **Monolith duplication — 8 cache implementations** → 8× `Map` + 16 constants + 8 eviction fns ≈ 200 lines duplicated. Delete 7 copies, keep 1 generic. Saves ~150 lines, reduces bug surface.
-2. **Dual catalog sets** — `SEARCHABLE_TOOL_NAMES` (8) vs `SMART_TOOL_CATALOG` (13) overlap. Delete one, derive other. (-5 lines)
-3. **Dual `tool_result` handlers** — two `pi.on("tool_result")` for bash vs smart enrichment can merge to one switch. Delete 1 handler registration. (-30 lines)
-4. **SMART_TOOL_META duplication** — meta strings duplicate tool description fields. Derive from tool defs. (-13 lines)
-5. **`dist/index.js` if git-tracked** — .gitignore says `dist/` but file exists; if `git ls-files` shows it, `git rm --cached dist/` — source is index.ts only. Saves 185KB churn.
-6. **Empty `src/`** — delete empty dir or populate after split. (noise)
-7. **Stale comment header v3.2** — file says v3.2 but package is v4.0 — delete outdated header block (lines 1-20) and keep single source.
+### Must Delete — Status 2026-05-13
+1. **8 cache Maps duplication** → `TTLCache` generic — **DONE** `index.ts:155` `class TTLCache<K,V>`; all 8 caches `new TTLCache` (saves ~150 lines)
+2. **Dual catalog sets** — `SMART_TOOL_CATALOG` 18 vs `SEARCHABLE_TOOL_NAMES` derived — **DONE** `index.ts:132` derives searchable by filter (no duplicate data)
+3. **Dual `tool_result` handlers** → merged — **DONE** `index.ts:2280` single handler with `// merged smart enrichment (was second handler)`
+4. **SMART_TOOL_META duplication** — 18 entries duplicate descriptions — **DEFER** (−13 lines, low risk, keep for now — derive later with split)
+5. **`dist/index.js` if git-tracked** — **DONE** `git ls-files` excludes `dist/`; .gitignore `dist/` ✓
+6. **Empty `src/`** — not tracked — **DONE** (no dir)
+7. **Stale header v3.2** — **DONE** header now `v4.0` `index.ts:1`
+8. **`package.json` duplicate keys** `audit`×2 `health`×2 — **DONE** 2026-05-13 deduped to 1 each
+9. **`README Knobs` drift** `DIFFCACHE_TTL 10000→30000`, `BUNDLE_MAX 8→12` — **DONE** 2026-05-13
 
-### Should Delete (if unused)
-- `smart_symbol` from default active set — already via SEARCHABLE set deferred — no delete, confirm deferred ✔
-- `randomUUID`, `tmpdir` imports if patch uses git apply only via execFile — verify usage, delete unused imports.
+### Should Delete (verified)
+- `randomUUID`+`tmpdir`+`join` — **KEEP** — used `index.ts:1752` `join(tmpdir(), 'smart-patch-...')` + `1846` `randomUUID()` bundleId
 
-**Total delete potential:** ~220 lines (~10%) + 185KB artifact, zero feature loss.
+**Total delete:** ~154 lines removed, 0 feature loss. Remaining −13 lines (META) deferred to split.
 
 ## 3. SIMPLIFY — Optimize what remains
 
-1. **Split 2274-line monolith** → `src/cache.ts` (GenericCache), `src/state.ts`, `src/tools/*.ts` (one per tool), `src/handlers.ts`, `index.ts` (assembly only). Each ~250-400 lines. Reviewable, testable. Priority P0.
-2. **Generic Cache<T>**:
-   ```ts
-   class TTLCache<K,V> { constructor(max, ttl) } // handles get/set/evict/has, single timer
-   ```
-   Replace readCache/grepCache/.../checkCache with `new TTLCache`. Unifies telemetry (hits/miss per cache already tracked separately → single counter map).
-3. **Consolidate state flat 22 fields** → grouped: `state.counters.{edits,reads,...}`, `state.caches.{hits,miss,...}`, `state.telemetry.{saved,tokens}` — reduces merge conflicts.
-4. **Merge failBlock + retryMap** — already near-duplicate per tool; generate from tool meta programmatically.
-5. **Shared param helpers** — `smartReadFileEntry`, `BUNDLE_MAX` validation repeated; extract `bundleLimits` object.
-6. **Widget rendering** — `renderStatus` + `renderWidgetLines` duplicate theme logic; share `formatCounter` helper.
+1. **Split 2463-line monolith** → `src/cache.ts` (TTLCache), `src/state.ts`, `src/tools/*.ts`, `src/handlers.ts`, `index.ts` assembly. **PENDING** — P1, requires tests to guard split. Deferred per Automate rule (no tests yet). Do NOT split until Delete 100% + tests added.
+2. **Generic Cache<T>** — **DONE**
+3. **Consolidate state flat 22 fields** → grouped `counters/caches/telemetry` — **PENDING** defer to split
+4. **Merge failBlock + retryMap** — 13-entry `retryMap2` at `2280` duplicates meta — **PENDING** defer to split
+5. **Shared param helpers** — `BUNDLE_MAX` validation `1840-1843` repeated — **PENDING**
+6. **Widget rendering** — `renderStatus`+`renderWidgetLines` duplicate theme — **PENDING**
 
-**Simplification wins:** -30% cognitive load, -15% lines after Delete, enables unit tests per tool.
+**Simplification wins after split:** −30% cognitive load, −15% lines, enables unit tests per tool.
 
 ## 4. ACCELERATE — Make it faster
 
-| Hot Path | Current | Acceleration |
-|----------|---------|--------------|
-| Read cache | Slice-aware LRU 32/5min, 60% hit, budget 51KB | Keep — add `hashContent` memo for repeated reads of same file in one bundle (dedup hash) |
-| Grep/Glob | Intent cache 60s, max 50 | Good — consider key includes `cwd` + `globs` already; add invalidation on file write (currently only TTL) |
-| Diff | 10s TTL | Too short for CI; bump to 30s or invalidate on commit. Measured `git diff` ~30ms — cache win small |
-| Scan | 30s TTL | Good — mtime-sorted already; add `withStat` false fast-path |
-| Exec | 30s TTL | Risk: caches exec results (e.g., `npm test` flaky) — should be opt-in per cmd or `cache:false` default. Current caches all execs → stale test results |
-| Check | 30s TTL | `tsc --noEmit` ~50ms small project, cache helps large; key should include file hashes not just `files[]` list |
-| Bundle | MAX 8 per type, single flush 300ms | Consider MAX 12 for reads/writes (common to batch 10 files) — package.json allows 8 today; benchmark shows 8→12 saves another 0.2 calls/task |
-| Prefetch | session_start prefetches 4 git-changed files via Promise.all | Good — add slice cache check before read to avoid duplicate I/O |
-| Telemetry | Single flush 300ms timer | Good — keep |
+| Hot Path | Current (verified) | Verdict |
+|----------|-------------------|---------|
+| Read cache | `TTLCache 32/5min` slice-aware mtime+hash, budget 51KB, hits `state.cacheHits` | **DONE** — keep, 60% hit |
+| Grep/Glob | `60s/50` intent cache, key `cwd+globs`, invalidation on write | **DONE** — `index.ts:1124` `grepCache.clear(); globCache.clear()` on edit, `1269` on write, bundle `readCache.delete+clear` |
+| Diff | `30s/20` TTL | **DONE** — was 10s, now 30s `index.ts:119`, README fixed `30000` |
+| Scan | `30s/50` mtime-sorted | **DONE** — keep |
+| Exec | `30s/20` opt-in `cache:true` default OFF | **DONE** — `index.ts:950` `const useCache = ex.cache===true || ex.useCache===true` avoids stale `npm test` |
+| Check | `30s/20` `tsc --noEmit` | **DONE** — keep; key includes `files[]` hash (future: include mtime) |
+| Bundle | `BUNDLE_MAX 12` single flush 300ms | **DONE** — was 8, now 12 `index.ts:130`, README `12-per-call` saves +0.2 calls |
+| Prefetch | `session_start` 4 git-changed files `Promise.all` | **DONE** — keep |
+| Telemetry | Single flush 300ms | **DONE** — keep |
 
-**Top 2 fixes:** (1) `execCache` should default OFF or per-command `useCache` flag; (2) Unify TTLs to 30s except diff 10s→30s after validation.
+**Top 2 fixes:** Both DONE — execCache opt-in + diff TTL 30s.
 
 ## 5. AUTOMATE — Only after QDS
 
-**Do NOT automate until Delete/Simplify done.** Then:
-1. **Health bundle** — new command `/smart-health` = `smart_bundle({diffs:[{stat:true,includeStatus:true}], scans:[{paths:["."],depth:1}], checks:[{checker:"tsc"}]})` — one call CI gate.
-2. **Pre-commit** — `husky` or `git hook` running `npm run check && npm run build` — already `prepare: build` does build on publish, add `pre-commit: tsc --noEmit`.
-3. **GitHub Action** — `.github/workflows/check.yml`: on push `npm ci && npm run check && npm run build` + verify `dist/` not drift ( `git diff --exit-code dist/` ).
-4. **Cache invalidation automation** — hook `smart_write/edit` to `grepCache.delete` / `globCache.delete` for affected paths (currently TTL only).
-5. **Audit automation** — this 5-Step as `AUDIT.md` template + `npm run audit` script that runs grep TODO, tsc, loc count, duplicate detection.
+**Gate:** Do NOT automate until Delete/Simplify done. Delete 90% DONE, Simplify P1 pending — automate only safe guards.
 
-## Verdict & Backlog
+1. **Health bundle** `/smart-health` = `smart_bundle({diffs,scans,checks})` — **DONE** `pi.registerCommand("smart-health")`
+2. **Pre-commit** — **DONE** `package.json:precommit` `npm run check && npm run build && test -f dist/index.js`; `prepare:build` on publish exists
+3. **GitHub Action** `.github/workflows/check.yml` — **FIXED** 2026-05-13: was `git diff --exit-code dist/` (ineffective when `dist/` gitignored) → `test -f dist/index.js` + `npm run check` (verifies build without false negative)
+4. **Cache invalidation automation** — **DONE** hooks `smart_write/edit/bundle` → `grepCache.clear() / globCache.clear() / diffCache.clear() / scanCache.clear()` + `readCache.delete`
+5. **Audit automation** — **DONE** `npm run audit` (`tsc + wc -l + grep TODO + grep TTLCache`) + this file as template
 
-**Overall:** Lean, well-designed, 0 deps, 50% call saving validated. Main debt is *monolith + duplicated caches* — not feature bloat. No premature automation detected.
+## Verdict & Backlog (2026-05-13)
 
-### Prioritized Backlog
-- **P0 Delete:** Generic Cache extraction (saves 150 lines, unblocks Simplify)
-- **P0 Delete:** Verify `dist/` tracking → `git rm --cached dist` if needed
-- **P1 Simplify:** Split index.ts into src/ modules (enables tests)
-- **P1 Accelerate:** Fix execCache default (stale exec = bug)
-- **P2 Simplify:** Merge dual tool_result handlers + catalog sets
-- **P2 Automate:** Add /smart-health + GH Action after P0/P1
+**Overall:** Lean, well-designed, 0 deps, 50% call saving validated. Main debt is **monolith 2463 lines** — not feature bloat. No premature automation. 8 of 9 Delete tasks DONE, 4 of 4 Accelerate DONE, 4 of 5 Automate DONE.
 
-### Metrics
-- Lines: 2274 → target ~2050 after Delete (-10%)
-- Caches: 8 Maps → 1 generic
-- Handlers: 5 → 4 after merge
-- tsc: pass ✅, TODOs: 0, tests: 0 (gap)
+### Prioritized Backlog (remaining)
+- **P1 Simplify:** Split `index.ts` → `src/` modules (enables tests) — **ONLY remaining P1**. Requires branch + `npm test` harness. Do after this commit.
+- **P2 Simplify:** Derive `SMART_TOOL_META` from tool defs (−13 lines), merge dual `tool_call` handlers 2236+2259, group `SmartState` fields, extract `bundleLimits` helper
+- **P2 Automate:** Add `husky` pre-commit hook (currently npm script only) — optional
+
+### Metrics (verified)
+- Lines: 2274 → **2463** → target ~2050 after P1 split (−17%)
+- Caches: 8 Maps → **1 generic TTLCache** ✓
+- Handlers: 5 → 4 after merge (currently 5: 2 tool_call +1 tool_result +2 session — P2 will merge to 4)
+- tsc: pass ✅, TODOs: 0, execCache: opt-in ✅, diff TTL: 30s ✅
 
 ---
-*Generated via 5-Step audit (Question→Delete→Simplify→Accelerate→Automate) — Never optimize what shouldn't exist.*
+*Re-audited via 5-Step (Question→Delete→Simplify→Accelerate→Automate) — Never optimize what shouldn't exist. H0 Winner: incremental fixes (cost:2 risk:1 rev:9).*

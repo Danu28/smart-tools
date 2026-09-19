@@ -45,7 +45,6 @@
     "audit": "npm run check && echo '--- loc ---' && wc -l index.ts && echo '--- TODOs ---' && grep -r \"TODO|FIXME\" index.ts || echo '0 TODOs' && echo '--- caches ---' && grep -c \"TTLCache\" index.ts && echo 'audit ok'",
     "health": "npm run check && git diff --stat && git status --porcelain",
     "lint": "tsc --noEmit --skipLibCheck",
-    "audit": "npm run check && echo '--- loc ---' && wc -l index.ts && echo '--- TODOs ---' && grep -r \"TODO|FIXME\" index.ts || echo '0 TODOs' && echo '--- caches ---' && grep -c \"TTLCache\" index.ts && echo 'audit ok'",
-    "health": "npm run check && git diff --stat && git status --porcelain"
+    "precommit": "npm run check && npm run build && test -f dist/index.js"
   }
 }
