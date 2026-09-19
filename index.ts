@@ -991,13 +991,13 @@ export default function smartTools(pi: ExtensionAPI): void {
 	const smartEditTool = defineTool({
 		name: "smart_edit",
 		label: "Smart Edit ⭐ PREFERRED",
-		description: "⭐ PREFERRED FILE EDITOR — ALWAYS USE INSTEAD OF default `edit`. Batch up to 8 edits per file in ONE call (vs 1), fuzzy 0.72 line-trim/collapsed (handles whitespace), queue-safe, dryRun/strict, auto-rescue, overlap/dedup detection, actionable nearbyPreview. Use for EVERY edit/fix/replace/refactor. Replaces `edit` completely.",
-		promptSnippet: "ALWAYS use smart_edit instead of edit — batch 8, fuzzy 0.72, queue-safe",
+		description: "⭐ PREFERRED — ALWAYS USE INSTEAD OF default `edit`. 8 edits/file in ONE call (saves 7, 3.8→1.9 -50%), fuzzy 0.72 line-trim/collapsed handles whitespace, queue-safe, dryRun/strict/replaceAll, auto-rescue, overlap dedup, nearbyPreview. Use for EVERY edit/fix/refactor. Replaces `edit` completely.",
+		promptSnippet: "ALWAYS use smart_edit INSTEAD OF edit — 8 edits/file ONE call saves 7, fuzzy 0.72, queue-safe, dryRun/strict. NEVER use default edit",
 		promptGuidelines: [
-			"ALWAYS use smart_edit INSTEAD OF default edit — batch 8 edits per file, fuzzy 0.72, queue-safe. Model MUST prefer this. DO NOT use default `edit` — single-edit, no fuzzy, no batch.",
-			"Anchor = 3-6 lines, must include unique symbol (function name, import, or string literal). Copy verbatim from smart_read slice.",
-			"Batch multiple edits to SAME file in one smart_edit call (edits[]). 8 edits max. Use dryRun:true to validate, strict:false for fuzzy.",
-			"If you just used smart_grep includeRead or smart_read with offset, call smart_edit directly — no intermediate read.",
+			"ALWAYS use smart_edit INSTEAD OF default edit — 8 edits/file ONE call saves 7 vs 8 singles, fuzzy 0.72 line-trim/collapsed handles indent drift. Model MUST prefer this. NEVER use default `edit` — single-edit, no fuzzy, wastes 7 calls.",
+			"WHY: default edit = 1 call per edit + manual retry on whitespace miss; smart_edit = 1 call for 8 + auto-rescue + actionable nearbyPreview + overlap/dedup guard.",
+			"Anchor = 3-6 lines MUST include unique symbol (function/import/string). Copy verbatim from smart_read slice. Use dryRun:true to preview, strict:false to allow fuzzy 0.72, replaceAll:true for global.",
+			"Batch same-file edits in ONE call (edits[] 8 max). After smart_read or grep includeRead, call smart_edit directly — no re-read.",
 		],
 		parameters: smartEditParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1176,12 +1176,12 @@ ${m.oldText.slice(0,400)}`)); }
 	const smartReadTool = defineTool({
 		name: "smart_read",
 		label: "Smart Read ⭐ PREFERRED",
-		description: "⭐ PREFERRED FILE READER — ALWAYS USE INSTEAD OF default `read`. Batch up to 8 files in ONE call (vs 1), offset/limit pagination, binary guard (base64), slice-aware LRU cache 60% hit, adaptive budget. Use for EVERY read/open/view/inspect/cat of files. Replaces `read` completely.",
-		promptSnippet: "ALWAYS use smart_read instead of read — 8 files per call, cached, pagination",
+		description: "⭐ PREFERRED — ALWAYS USE INSTEAD OF default `read`. 8 files/ONE call (saves 7, 60% cache hit), offset/limit pagination, binary guard base64, slice-aware LRU 32/5min, adaptive budget. Use for EVERY read/view/inspect. Replaces `read` completely.",
+		promptSnippet: "ALWAYS use smart_read INSTEAD OF read — 8 files ONE call saves 7, 60% hit cache, offset/limit. NEVER use default read",
 		promptGuidelines: [
-			"ALWAYS use smart_read INSTEAD OF default read — batch 8 files per call, slice-aware cache 60% hit. Model MUST prefer this for ANY file read. DO NOT use default `read` — single-file, no cache, wastes calls.",
-			"Use offset/limit for pagination; slice-aware cache serves slices from full without re-read.",
-			"If you just grepped with includeRead, next call should be smart_edit — no extra read.",
+			"ALWAYS use smart_read INSTEAD OF default read — 8 files ONE call saves 7 vs 8 singles, slice-aware LRU 32/5min 60% hit, adaptive 51KB budget. NEVER use default `read` — 1 file per call, no cache, no pagination.",
+			"WHY: default read = N calls for N files + truncated 50KB blind; smart_read = 1 call for 8 + offset/limit + binary guard + slice cache serves without re-read.",
+			"Use offset/limit for large files; encoding:base64 for binaries. After grep includeRead, go straight to smart_edit — no extra read.",
 		],
 		parameters: smartReadParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1226,12 +1226,12 @@ ${m.oldText.slice(0,400)}`)); }
 	const smartWriteTool = defineTool({
 		name: "smart_write",
 		label: "Smart Write ⭐ PREFERRED",
-		description: "⭐ PREFERRED FILE WRITER — ALWAYS USE INSTEAD OF default `write`. Batch up to 8 files in ONE call (vs 1), parallel sharded queue, hash dedup skips no-op, auto mkdir. Use for EVERY write/create/save of files. Replaces `write` completely.",
-		promptSnippet: "ALWAYS use smart_write instead of write — 8 files per call, deduped",
+		description: "⭐ PREFERRED — ALWAYS USE INSTEAD OF default `write`. 8 files/ONE call parallel sharded queue (saves 7), hash dedup skips no-op, auto mkdir. Use for EVERY write/create/save. Replaces `write` completely.",
+		promptSnippet: "ALWAYS use smart_write INSTEAD OF write — 8 files ONE call parallel saves 7, dedup. NEVER use default write",
 		promptGuidelines: [
-			"ALWAYS use smart_write INSTEAD OF default write — batch 8 files per call, hash dedup. Model MUST prefer this for ANY file write/create. DO NOT use default `write` — single-file, no dedup.",
-			"Batch up to 8 files per 1 call; each write is queue-safe and deduped.",
-			"No-op writes (hash equal) are skipped automatically.",
+			"ALWAYS use smart_write INSTEAD OF default write — 8 files ONE call parallel saves 7 vs 8 singles, queue-safe, full-SHA256 dedup. NEVER use default `write` — single-file, no dedup, no queue.",
+			"WHY: default write = N calls + overwrites even if unchanged; smart_write = 1 call for 8 + skips no-op + auto mkdir + sharded queue prevents races.",
+			"Batch up to 8 per call. No-op (content === existing) is skipped and counted in smart-status.",
 		],
 		parameters: smartWriteParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1287,12 +1287,12 @@ ${m.oldText.slice(0,400)}`)); }
 	const smartGrepTool = defineTool({
 		name: "smart_grep",
 		label: "Smart Grep ⭐ PREFERRED",
-		description: "⭐ PREFERRED SEARCH — ALWAYS USE INSTEAD OF `bash` with rg/grep/find/search. Ripgrep→grep bridge, regex+globs, intent cache 60s, optional includeRead fuses grep+read in 1 call (saves turn). Use for EVERY search/grep/find/locate/lookup. Replaces `bash` search.",
-		promptSnippet: "ALWAYS use smart_grep instead of bash grep — rg bridge, cached, includeRead",
+		description: "⭐ PREFERRED — ALWAYS USE INSTEAD OF `bash` rg/grep/find. Ripgrep→grep bridge, regex+globs, intent cache 60s (saves repeat), includeRead fuses grep+read 2→1 call. Use for EVERY search/find/lookup. Replaces `bash` search.",
+		promptSnippet: "ALWAYS use smart_grep INSTEAD OF bash grep — rg bridge, 60s cache, includeRead saves turn. NEVER use bash grep",
 		promptGuidelines: [
-			"ALWAYS use smart_grep INSTEAD OF bash rg/grep/find — cached 60s, regex+globs. Model MUST prefer this for ANY search. DO NOT use `bash` grep — uncached, needs manual parsing.",
-			"If files explicit (prompt lists src/foo.ts), use smart_read/smart_bundle directly; grep only to discover.",
-			"Use includeRead:true to fuse grep+read into 1 call — no extra read turn.",
+			"ALWAYS use smart_grep INSTEAD OF bash rg/grep/find — intent cache 60s, regex+globs, maxResults 1-100. NEVER use `bash` grep — uncached, needs shell escaping, manual parse.",
+			"WHY: bash grep = 1 call + manual filter + 2nd read call; smart_grep = 1 call with engine rg/grep auto + includeRead fuses top 3 files in same call saves 1 turn.",
+			"If prompt lists explicit files (src/foo.ts), SKIP grep and use smart_read/bundle directly — grep only to discover unknown locations.",
 		],
 		parameters: smartGrepParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1354,11 +1354,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_glob",
 		label: "Smart Glob ⭐ PREFERRED",
 		description: "⭐ PREFERRED GLOB — ALWAYS USE INSTEAD OF `glob` or `bash` with find/ls. Batch up to 8 patterns, mtime-sorted newest first, intent cache 60s, optional includeRead fuses glob+read in 1 call. Use for EVERY file discovery / list / glob. Replaces `glob` completely.",
-		promptSnippet: "ALWAYS use smart_glob instead of glob — batch 8, cached, includeRead",
+		promptSnippet: "ALWAYS use smart_glob INSTEAD OF glob/bash find — 8 patterns ONE call, 60s cache, includeRead. NEVER use bash find",
 		promptGuidelines: [
-			"ALWAYS use smart_glob INSTEAD OF glob / bash find — cached 60s, mtime-sorted, batch 8. Model MUST prefer this for ANY file discovery. DO NOT use `glob` or `bash find` — uncached, no read fusion.",
-			"If you already know the file, use smart_read/smart_bundle directly; glob only to discover.",
-			"Use includeRead:true to fuse glob+read into 1 call — no extra read turn.",
+			"ALWAYS use smart_glob INSTEAD OF glob/bash find — batch 8 patterns ONE call saves 7, mtime-sorted, 60s cache. NEVER use bash find — uncached, needs find -name + parsing.",
+			"WHY: glob default = 1 call per pattern + manual ls; smart_glob = 1 call for 8 + includeRead fuses top files saves 1 turn.",
+			"If files known (prompt lists src/foo.ts), SKIP glob and use smart_read/bundle directly. Use includeRead:true to fuse discovery+read.",
 		],
 		parameters: smartGlobParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1414,8 +1414,8 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_undo",
 		label: "Smart Undo ⟲",
 		description: "⟲ ATOMIC UNDO — Reverts last smart_edit / smart_write / smart_bundle change via local undo stack (no git needed). Use when an edit was wrong or to rollback. Supports batch lastBundle revert.",
-		promptSnippet: "Use smart_undo to revert last edit/write/bundle atomically",
-		promptGuidelines: ["Use smart_undo instead of manual re-edit or bash git checkout — atomic, instant, no re-read.", "Prefer smart_undo single file vs lastBundle"],
+		promptSnippet: "Use smart_undo INSTEAD OF bash git checkout — atomic 32-stack revert",
+		promptGuidelines: ["ALWAYS use smart_undo INSTEAD OF bash git checkout/manual re-edit — atomic via undo stack 32, instant, bundleId-grouped. NEVER use bash checkout for smart edits.", "Prefer single-file undo vs lastBundle (reverts last smart_bundle group)."],
 		parameters: smartUndoParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			onUpdate?.({ message: "smart_undo: searching history" } as any);
@@ -1477,10 +1477,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_diff",
 		label: "Smart Diff ⭐ PREFERRED",
 		description: "⭐ PREFERRED GIT DIFF — ALWAYS USE INSTEAD OF `bash` with git diff/status/log. Cached 10s, staged/stat/base, single call returns diff+status+log. Use for EVERY git diff/status/log. Replaces `bash` git.",
-		promptSnippet: "ALWAYS use smart_diff instead of bash git diff — cached 10s",
+		promptSnippet: "ALWAYS use smart_diff INSTEAD OF bash git diff — cached 10s, staged/stat/base. NEVER use bash git diff",
 		promptGuidelines: [
-			"ALWAYS use smart_diff INSTEAD OF bash git diff/status/log — cached 10s, staged/stat/base. Model MUST prefer this for ANY git diff. DO NOT use `bash` git diff — uncached, no structured output.",
-			"Use includeStatus:false to skip status, includeLog:true for log, stat:true for --stat.",
+			"ALWAYS use smart_diff INSTEAD OF bash git diff/status/log — single call returns diff+status+log, cached 10s, staged/stat/base. NEVER use bash git diff — 3 calls, uncached, noisy.",
+			"WHY: bash git = 3 calls (diff + status + log) + parsing; smart_diff = 1 call cached 10s with structured files list + stat.",
+			"Use staged:true for --cached, stat:true for --stat, includeLog:true for log, base:HEAD for compare.",
 		],
 		parameters: smartDiffParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1511,10 +1512,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_scan",
 		label: "Smart Scan ⭐ PREFERRED",
 		description: "⭐ PREFERRED SCAN — ALWAYS USE INSTEAD OF `bash` with ls/tree/stat. Batch up to 8 dirs, depth 1-5, mtime-sorted, stat, optional includeRead. Use for EVERY directory listing / tree / stat. Replaces `bash` ls.",
-		promptSnippet: "ALWAYS use smart_scan instead of bash ls — batch 8, mtime-sorted",
+		promptSnippet: "ALWAYS use smart_scan INSTEAD OF bash ls/tree — batch 8 dirs, mtime-sorted, cached 30s. NEVER use bash ls",
 		promptGuidelines: [
-			"ALWAYS use smart_scan INSTEAD OF bash ls/tree/stat — batch 8, mtime-sorted, depth. Model MUST prefer this for ANY listing. DO NOT use `bash` ls — noisy, needs parsing.",
-			"Use includeRead:true to fuse scan+read.",
+			"ALWAYS use smart_scan INSTEAD OF bash ls/tree/stat — batch 8 dirs ONE call saves 7, mtime-sorted, depth 1-5, 30s cache. NEVER use bash ls — noisy, needs parsing, no mtime sort.",
+			"WHY: bash ls = N calls + ls -la parse + separate stat; smart_scan = 1 call for 8 dirs with size/mtime + optional includeRead fusion.",
+			"Use depth 2-5 for tree, limit 50, includeRead:true to fuse listing+read.",
 		],
 		parameters: smartScanParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1552,10 +1554,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_exec",
 		label: "Smart Exec ⭐ PREFERRED",
 		description: "⭐ PREFERRED EXEC — ALWAYS USE INSTEAD OF `bash` for multiple commands. Batch up to 8 commands, each with timeout/cwd, summarize, queue-safe. Use for EVERY bash batch / npm test / tsc / git. Replaces `bash` batch.",
-		promptSnippet: "ALWAYS use smart_exec instead of bash for batches — 8 cmds, summarized",
+		promptSnippet: "ALWAYS use smart_exec INSTEAD OF bash for batches — 8 cmds ONE call, timeout, risk guard, 30s cache. NEVER use bash for 2+ cmds",
 		promptGuidelines: [
-			"ALWAYS use smart_exec INSTEAD OF bash for 2+ commands — batch 8, summarized, cache 30s. Model MUST prefer this for ANY batch. DO NOT use `bash` for multiple cmds — uncached, needs manual parsing.",
-			"Use summarize:true (default) to auto-extract FAIL.*file:line. Use parallel:false for serial.",
+			"ALWAYS use smart_exec INSTEAD OF bash for 2+ commands — batch 8 ONE call saves 7, timeout/cwd per cmd, risk guard blocks rm -rf /, 30s cache, summarized. NEVER use bash for batches — N calls, no guard, manual exitCode.",
+			"WHY: bash batch = N calls + N timeout handling + manual output concat; smart_exec = 1 call with parallel:false default + summarized fails + execCache.",
+			"Use {cmd, timeout:30000, cwd:'subdir'} per entry. Fallback is never bash for batches.",
 		],
 		parameters: smartExecParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1606,9 +1609,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_symbol",
 		label: "Smart Symbol ⭐ PREFERRED",
 		description: "⭐ PREFERRED SYMBOL — ALWAYS USE INSTEAD OF `grep` for symbols. Regex LSP-lite for function/class/interface/type/const, returns definition + preview. Use for EVERY goto-definition. Replaces `grep` for symbols.",
-		promptSnippet: "ALWAYS use smart_symbol instead of grep for symbols — LSP-lite",
+		promptSnippet: "ALWAYS use smart_symbol INSTEAD OF grep for symbols — LSP-lite 85% accuracy, 60s cache. NEVER use grep for symbols",
 		promptGuidelines: [
-			"ALWAYS use smart_symbol INSTEAD OF grep for function/class/interface/type/const — regex parsed, 85% accuracy. Model MUST prefer this for ANY symbol. DO NOT use `grep` for symbols — no kind, no preview.",
+			"ALWAYS use smart_symbol INSTEAD OF grep for symbols — LSP-lite regex parses function/class/interface/type/const with preview, 85% accuracy, 60s cache. NEVER use grep — no kind filter, no signature.",
+			"WHY: grep symbol = raw hits + manual file parse; smart_symbol = filtered by kind + signature + line + truncated preview in one call.",
+			"Use kind:'function'|'class'|'interface'|'type'|'const' to narrow, limit 1-50.",
 		],
 		parameters: smartSymbolParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1655,9 +1660,11 @@ ${m.oldText.slice(0,400)}`)); }
 		name: "smart_check",
 		label: "Smart Check ⭐ PREFERRED",
 		description: "⭐ PREFERRED CHECK — ALWAYS USE INSTEAD OF `bash` with tsc/eslint. Structured tsc --noEmit, cache 30s, returns file:line:col + message. Use for EVERY typecheck/lint. Replaces `bash` tsc.",
-		promptSnippet: "ALWAYS use smart_check instead of bash tsc — structured, cached",
+		promptSnippet: "ALWAYS use smart_check INSTEAD OF bash tsc/eslint — structured file:line:col, 30s cache. NEVER use bash tsc",
 		promptGuidelines: [
-			"ALWAYS use smart_check INSTEAD OF bash tsc --noEmit / eslint — structured, cached 30s. Model MUST prefer this for ANY check. DO NOT use `bash` tsc — unparsed 2000 lines.",
+			"ALWAYS use smart_check INSTEAD OF bash tsc/eslint — structured file:line:col+message, 30s cache, checker:'tsc'|'eslint'|'all'. NEVER use bash tsc — dumps 2000 lines unparsed, no cache.",
+			"WHY: bash tsc = spawn npx + raw 50KB output; smart_check = cached 30s + parsed errors + optional files filter.",
+			"Use files:['src/app.ts'] to check single file, checker:'tsc' for type-only.",
 		],
 		parameters: smartCheckParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1703,11 +1710,11 @@ const smartPatchTool = defineTool({
 		name: "smart_patch",
 		label: "Smart Patch ⭐ PREFERRED",
 		description: "⭐ PREFERRED PATCHER — ALWAYS USE INSTEAD OF `bash` with git apply/patch. Atomic unified diff via `git apply --check`, path-traversal guard, auto-fallback to smart_edit anchors. Use for EVERY diff/patch/apply. Replaces `bash` git apply.",
-		promptSnippet: "ALWAYS use smart_patch instead of bash git apply — atomic + fallback",
+		promptSnippet: "ALWAYS use smart_patch INSTEAD OF bash git apply — atomic + fallback to edits. NEVER use bash git apply",
 		promptGuidelines: [
-			"ALWAYS use smart_patch INSTEAD OF bash git apply/patch — atomic check + auto fallback. Model MUST prefer this for ANY diff/patch. DO NOT use `bash` git apply — no fallback, no guard.",
-			"Use smart_patch for multi-file diffs; for 1-file ≤2 hunks prefer smart_edit — cheaper.",
-			"If git apply fails, it auto-fallbacks to smart_edit anchors in same call.",
+			"ALWAYS use smart_patch INSTEAD OF bash git apply — atomic git apply --check, path-traversal guard, fallback to smart_edit anchors. NEVER use bash git apply — no guard, no fallback, no cache clear.",
+			"WHY: bash git apply = manual tmp file + check + apply + no fallback; smart_patch = one call with validation + auto fallback + cache invalidation.",
+			"Use for multi-file unified diffs; for 1-file ≤2 hunks prefer smart_edit — cheaper and fuzzy.",
 		],
 		parameters: smartPatchParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -1792,12 +1799,13 @@ const smartPatchTool = defineTool({
 	const smartBundleTool = defineTool({
 		name: "smart_bundle",
 		label: "Smart Bundle ⭐⭐ STRONGLY PREFERRED",
-		description: "⭐⭐ STRONGLY PREFERRED — ALWAYS USE INSTEAD OF any single read/edit/write/grep/bash. Heterogeneous bundle grep+read+edit+write in ONE LLM call (saves 3 turns, 3.8→1.9 calls -50%). Batch 8 per type. Use for ANY task with 2+ ops or multi-file work. HIGHEST EFFICIENCY — prefer over ALL defaults and individual smart_*.",
-		promptSnippet: "ALWAYS prefer smart_bundle — grep+read+edit+write in ONE call, saves 3 turns",
+		description: "⭐⭐ STRONGLY PREFERRED — ALWAYS USE INSTEAD OF any single read/edit/write/grep/bash. ONE call bundles greps(4)+globs(8)+diffs(4)+scans(8)+execs(8)+symbols(8)+checks(4)+reads(8)+edits(8)+writes(8) = up to 70 ops. Saves 3 turns, 3.8→1.9 avg -50%, single flush queue-safe. Use for ANY task with 2+ ops or multi-file work. HIGHEST EFFICIENCY — prefer over ALL defaults.",
+		promptSnippet: "⭐⭐ ALWAYS prefer smart_bundle OVER all singles — ONE call = reads+greps+edits+writes (8 each), 3.8→1.9 -50%, queue-safe. Use for ANY 2+ ops",
 		promptGuidelines: [
-			"ALWAYS prefer smart_bundle OVER any single smart_read/smart_edit/smart_write/smart_grep and OVER default read/edit/write/bash. Batch greps→reads→edits→writes in ONE call. DO NOT use single-file defaults when 2+ ops needed.",
-			"Prefer smart_bundle: {reads:[...], greps:[...], edits:[{path,edits}...], writes:[...]} in ONE call vs 3-4 serial turns. Model MUST choose this when 2+ ops needed.",
-			"Example: bundle greps→reads→edits→writes; fallback to individual tools only if needed. Batch 8 per type.",
+			"⭐⭐ ALWAYS prefer smart_bundle OVER any single smart_read/edit/write/grep AND over default read/edit/write/bash. ONE call = greps(4)+globs(8)+diffs+scans+execs+symbols+checks+reads(8)+edits(8)+writes(8) up to 70 ops. Model MUST choose this when 2+ ops needed. NEVER use singles for batches.",
+			"WHY TABLE: 3 file reads = 3 calls default vs 1 bundle saves 2 (66%); grep+read = 2 calls vs 1 bundle with includeRead saves 1; edit 2 files = 2 calls vs 1 bundle saves 1; 8-file refactor = 8 calls vs 1 bundle saves 7. Single telemetry flush (300ms) + shared caches + queue-safe.",
+			"ORDER: greps→globs→diffs→scans→execs→symbols→checks→reads→edits→writes in one call. Example: smart_bundle({reads:[{path:'src/app.ts'}], greps:[{query:'TODO'}], edits:[{path:'src/app.ts', edits:[{oldText:'a', newText:'b'}]}]}) saves 2 turns vs 3 singles. Fallback to singles only if 1 op.",
+			"GUIDE: Tier-1 explicit files → bundle reads+edits in 1 call. Tier-2 explore → bundle greps+globs+scans+reads then bundle edits. All edits use same Anchor rule (3-6 lines + unique symbol).",
 		],
 		parameters: smartBundleParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -2005,9 +2013,9 @@ const smartPatchTool = defineTool({
 	const searchSmartToolsTool = defineTool({
 		name: "search_smart_tools",
 		label: "Search Smart Tools",
-		description: "Discovery for ⭐ PREFERRED smart-tools: smart_read (replaces read), smart_write (replaces write), smart_edit (replaces edit), smart_grep (replaces bash grep), smart_patch (replaces bash patch), smart_bundle (replaces all). Call to list/activate.",
-		promptSnippet: "Use search_smart_tools to discover PREFERRED smart-tools — all replace defaults",
-		promptGuidelines: ["Use search_smart_tools to discover any PREFERRED smart-tool; lazy tools (grep/patch) auto-activate. ALL smart_* REPLACE defaults — always prefer them."] ,
+		description: "Discovery — lazy-loads PREFERRED smart-tools (saves prompt tokens). Call with {query:'grep'} to activate smart_grep/patch/glob/diff/scan/exec/symbol/check. Batch 60% of tools are deferred. Call to list/activate.",
+		promptSnippet: "Call search_smart_tools to lazy-load deferred PREFERRED tools — saves tokens until needed",
+		promptGuidelines: ["Call search_smart_tools{query:'grep|patch|glob|diff|scan|exec|symbol|check'} to activate deferred tools — keeps prompt lean (60% tools deferred). ALWAYS prefer activated smart_* over defaults. smart_read/write/edit/bundle are always active; others need activation.", "WHY: without call, agent defaults to bash/read; with call, agent sees ALWAYS rules + gets 50% call savings + caching. One call unlocks grep→patch→glob→diff→scan→exec→symbol→check."] ,
 		parameters: searchSmartToolsParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const qRaw = params.query.trim().toLowerCase();
